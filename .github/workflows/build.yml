@@ -24,7 +24,7 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GammaChanger-windows-x64
           path: build/Release/GammaChanger.exe
