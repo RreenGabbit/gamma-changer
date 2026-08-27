@@ -19,7 +19,7 @@ cl.exe /nologo /std:c++17 /O2 /MT /EHsc /W4 /permissive- /utf-8 ^
     /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /I ..\src ^
     ..\src\main.cpp ..\src\gamma_math.cpp GammaChanger.res ^
     /Fe:GammaChanger.exe ^
-    /link /SUBSYSTEM:WINDOWS /DYNAMICBASE /NXCOMPAT ^
+    /link /SUBSYSTEM:WINDOWS /DYNAMICBASE /NXCOMPAT /MANIFEST:NO ^
     advapi32.lib comctl32.lib gdi32.lib shell32.lib user32.lib wtsapi32.lib
 if errorlevel 1 goto :failed
 

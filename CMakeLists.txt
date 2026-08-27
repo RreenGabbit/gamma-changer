@@ -48,7 +48,8 @@ if(WIN32)
 
     if(MSVC)
         target_compile_options(GammaChanger PRIVATE /W4 /permissive- /utf-8)
-        target_link_options(GammaChanger PRIVATE /DYNAMICBASE /NXCOMPAT)
+        # GammaChanger.rc already embeds the complete application manifest.
+        target_link_options(GammaChanger PRIVATE /DYNAMICBASE /NXCOMPAT /MANIFEST:NO)
     elseif(MINGW)
         target_compile_options(GammaChanger PRIVATE -Wall -Wextra -Wpedantic)
         target_link_options(GammaChanger PRIVATE
