@@ -1,0 +1,9 @@
+/build/
+/build-local/
+*.obj
+*.res
+*.exe
+*.pdb
+*.ilk
+*.user
+.vs/
