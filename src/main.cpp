@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "gamma_math.h"
+#include "resource.h"
 
 namespace {
 
@@ -76,6 +77,28 @@ struct NativeGammaRamp {
 };
 
 static_assert(sizeof(NativeGammaRamp) == 3U * 256U * sizeof(WORD));
+
+struct ScopedIcon {
+    HICON value = nullptr;
+
+    ScopedIcon(HINSTANCE instance, const int widthMetric, const int heightMetric)
+        : value(static_cast<HICON>(LoadImageW(
+              instance,
+              MAKEINTRESOURCEW(IDI_GAMMA_CHANGER),
+              IMAGE_ICON,
+              GetSystemMetrics(widthMetric),
+              GetSystemMetrics(heightMetric),
+              LR_DEFAULTCOLOR))) {}
+
+    ScopedIcon(const ScopedIcon&) = delete;
+    ScopedIcon& operator=(const ScopedIcon&) = delete;
+
+    ~ScopedIcon() {
+        if (value != nullptr) {
+            DestroyIcon(value);
+        }
+    }
+};
 
 struct ScopedRegistryKey {
     HKEY value = nullptr;
@@ -1285,7 +1308,7 @@ void AddTrayIcon() {
     data.uID = kTrayIconId;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = kTrayMessage;
-    data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    data.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(g_mainWindow, GCLP_HICONSM));
     lstrcpynW(data.szTip, L"Gamma Changer", ARRAYSIZE(data.szTip));
     g_trayIconAdded = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
 }
@@ -1795,7 +1818,7 @@ LRESULT CALLBACK MainWindowProc(
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-bool RegisterWindowClasses() {
+bool RegisterWindowClasses(const HICON icon, const HICON smallIcon) {
     WNDCLASSEXW patternClass{};
     patternClass.cbSize = sizeof(patternClass);
     patternClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -1813,11 +1836,11 @@ bool RegisterWindowClasses() {
     mainClass.style = CS_HREDRAW | CS_VREDRAW;
     mainClass.lpfnWndProc = MainWindowProc;
     mainClass.hInstance = g_instance;
-    mainClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.hIcon = icon;
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hbrBackground = g_backgroundBrush;
     mainClass.lpszClassName = kWindowClassName;
-    mainClass.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+    mainClass.hIconSm = smallIcon;
     return RegisterClassExW(&mainClass) != 0U;
 }
 
@@ -1871,7 +1894,10 @@ int APIENTRY wWinMain(
 
     g_backgroundBrush = CreateSolidBrush(RGB(247, 249, 252));
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-    if (!RegisterWindowClasses()) {
+    const ScopedIcon icon(instance, SM_CXICON, SM_CYICON);
+    const ScopedIcon smallIcon(instance, SM_CXSMICON, SM_CYSMICON);
+    if (icon.value == nullptr || smallIcon.value == nullptr ||
+        !RegisterWindowClasses(icon.value, smallIcon.value)) {
         DeleteObject(g_backgroundBrush);
         CloseHandle(instanceMutex);
         return 1;

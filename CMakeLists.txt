@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     GammaChanger
-    VERSION 1.2.1
+    VERSION 1.2.2
     DESCRIPTION "Native Windows hardware gamma-ramp utility"
     LANGUAGES CXX)
 
@@ -28,7 +28,11 @@ if(WIN32)
     enable_language(RC)
     add_executable(GammaChanger WIN32
         src/main.cpp
+        src/resource.h
+        src/assets/flashbang.ico
         src/GammaChanger.rc)
+    set_source_files_properties(src/GammaChanger.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/flashbang.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/GammaChanger.manifest")
     target_link_libraries(GammaChanger PRIVATE
         gamma_math
         advapi32

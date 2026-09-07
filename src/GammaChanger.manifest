@@ -4,7 +4,7 @@
       name="GammaChanger"
       processorArchitecture="*"
       type="win32"
-      version="1.2.1.0" />
+      version="1.2.2.0" />
   <description>Gamma Changer</description>
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
