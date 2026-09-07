@@ -12,7 +12,7 @@ calibration instead of replacing it with a generic identity ramp.
 ## Features
 
 - Live gamma adjustment from `0.50` to `3.00`
-- Configurable dedicated key that toggles the selected display between `3.00` and `1.00`, regardless of held modifiers
+- Configurable dedicated key, including Right Shift, that toggles the selected display between `3.00` and `1.00`, regardless of held modifiers
 - Separate saved setting for each active Windows display device
 - Read-back verification to detect drivers that silently ignore gamma changes
 - One-click restoration of the captured Windows calibration
@@ -48,7 +48,7 @@ matching SHA-256 checksum is provided with each release.
 
 1. Select a display.
 2. Move the slider. The hardware ramp changes after a short debounce so dragging stays responsive.
-3. Press one non-modifier key beside **Single-key toggle**, then select **Set key**. Modifiers shown while recording are discarded.
+3. Click the key box beside **Single-key toggle**, press one key (for example **Right Shift**), then select **Set key**. Left and right modifier keys are separate choices. The recorder accepts only the first key pressed; key combinations are not supported. Click the box again to record a different key.
 4. Press that key once for maximum gamma (`3.00`) and again to restore the captured Windows baseline (`1.00`). It works even while Shift, Ctrl, or Alt is held. The chosen key is dedicated to Gamma Changer and its normal action is suppressed while the app runs.
 5. Use **Reset this display** to restore the ramp that Windows had before Gamma Changer changed it.
 6. Enable **Start with Windows** if the correction should survive sign-in and display resets.
@@ -74,7 +74,18 @@ also describes the newer MHC pipeline used by capable HDR/Advanced Color systems
 Gamma Changer intentionally limits itself to the interactive SDR gamma-ramp behavior
 requested here.
 
-## Test the platform-independent ramp math
+## Tests
+
+Run both the ramp-math and single-key regression tests with CMake on Windows or Linux:
+
+```bash
+cmake -S . -B build-local/tests -DBUILD_TESTING=ON
+cmake --build build-local/tests --config Release
+ctest --test-dir build-local/tests -C Release --output-on-failure
+```
+
+The Windows run also checks left/right modifier resolution using the Windows API.
+To compile just the platform-independent ramp math directly:
 
 On any C++17 system:
 

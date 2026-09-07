@@ -24,6 +24,8 @@
 
 #include "gamma_math.h"
 #include "resource.h"
+#include "single_key.h"
+#include "single_key_win32.h"
 
 namespace {
 
@@ -44,6 +46,7 @@ constexpr UINT kTrayIconId = 1U;
 constexpr UINT kTrayMessage = WM_APP + 1U;
 constexpr UINT kShowWindowMessage = WM_APP + 2U;
 constexpr UINT kSingleKeyMessage = WM_APP + 3U;
+constexpr UINT kKeyCapturedMessage = WM_APP + 4U;
 constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 
@@ -188,9 +191,9 @@ bool g_updatingControls = false;
 bool g_statusIsError = false;
 bool g_trayIconAdded = false;
 UINT g_taskbarCreatedMessage = 0U;
-UINT g_hotkeyVirtualKey = 0U;
+gamma_changer::SingleKeyInput g_singleKeyInput;
+UINT g_pendingHotkeyVirtualKey = 0U;
 HHOOK g_keyboardHook = nullptr;
-bool g_boundKeyIsDown = false;
 bool g_sliderApplyPending = false;
 
 std::wstring FormatSystemError(const DWORD error) {
@@ -530,27 +533,31 @@ void LoadHotkeySettings() {
     }
 
     DWORD virtualKey = 0U;
-    if (ReadDword(key.value, L"HotkeyVirtualKey", virtualKey) && virtualKey <= 0xFFU) {
-        g_hotkeyVirtualKey = virtualKey;
+    if (ReadDword(key.value, L"HotkeyVirtualKey", virtualKey)) {
+        g_singleKeyInput.SetBinding(virtualKey);
     }
 }
 
-bool SaveHotkeySettings(std::wstring& errorMessage) {
+bool SaveHotkeySettings(const DWORD virtualKey, std::wstring& errorMessage) {
     auto key = OpenRegistryKey(kAppRegistryPath, KEY_SET_VALUE, true);
     if (!key) {
         errorMessage = L"Could not save the hotkey for the current user.";
         return false;
     }
-    WriteDword(key.value, L"HotkeyVirtualKey", g_hotkeyVirtualKey);
-    // Clear modifier data written by versions that used combination hotkeys.
-    WriteDword(key.value, L"HotkeyFlags", 0U);
+    const LSTATUS status = RegSetValueExW(
+        key.value,
+        L"HotkeyVirtualKey",
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&virtualKey),
+        sizeof(virtualKey));
+    if (status != ERROR_SUCCESS) {
+        errorMessage = L"Could not save the single key: " + FormatSystemError(status);
+        return false;
+    }
+    // Combination settings are obsolete; only the single virtual key is used.
+    RegDeleteValueW(key.value, L"HotkeyFlags");
     return true;
-}
-
-WORD PackedHotkey(const UINT virtualKey) {
-    return MAKEWORD(
-        static_cast<BYTE>(virtualKey & 0xFFU),
-        0U);
 }
 
 std::wstring GetExecutablePath() {
@@ -705,48 +712,36 @@ void SetStatus(const std::wstring& message, const bool error) {
 }
 
 bool SingleKeyIsAllowed(const UINT virtualKey, std::wstring& errorMessage) {
-    if (virtualKey == 0U) {
-        errorMessage = L"Press one key in the key box first.";
+    if (!gamma_changer::IsSingleKeyAllowed(virtualKey)) {
+        errorMessage = L"Click the key box and press one key, such as Right Shift.";
         return false;
     }
-
-    switch (virtualKey) {
-        case VK_SHIFT:
-        case VK_LSHIFT:
-        case VK_RSHIFT:
-        case VK_CONTROL:
-        case VK_LCONTROL:
-        case VK_RCONTROL:
-        case VK_MENU:
-        case VK_LMENU:
-        case VK_RMENU:
-        case VK_LWIN:
-        case VK_RWIN:
-            errorMessage = L"Choose a non-modifier key, such as Caps Lock or an F-key.";
-            return false;
-        default:
-            return true;
-    }
+    return true;
 }
 
 LRESULT CALLBACK SingleKeyKeyboardProc(
     const int code,
     const WPARAM message,
     const LPARAM data) {
-    if (code == HC_ACTION && g_hotkeyVirtualKey != 0U) {
+    if (code == HC_ACTION) {
         const auto* keyboard = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
-        if (keyboard->vkCode == g_hotkeyVirtualKey) {
-            const bool isKeyDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-            const bool isKeyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
-            if (isKeyDown) {
-                if (!g_boundKeyIsDown) {
-                    g_boundKeyIsDown = true;
-                    PostMessageW(g_mainWindow, kSingleKeyMessage, 0, 0);
-                }
-                return 1;
+        const bool isKeyDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        const bool isKeyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
+        if (isKeyDown || isKeyUp) {
+            const bool keyBoxFocused = GetForegroundWindow() == g_mainWindow &&
+                                       GetFocus() == g_hotkeyControl;
+            if (!keyBoxFocused) {
+                g_singleKeyInput.CancelCapture();
             }
-            if (isKeyUp) {
-                g_boundKeyIsDown = false;
+            const UINT key = gamma_changer::SingleKeyFromHook(*keyboard);
+            const auto result = g_singleKeyInput.Process(key, isKeyDown, !keyBoxFocused);
+            if (result.action == gamma_changer::SingleKeyAction::Captured) {
+                g_pendingHotkeyVirtualKey = key;
+                PostMessageW(g_mainWindow, kKeyCapturedMessage, 0, 0);
+            } else if (result.action == gamma_changer::SingleKeyAction::Toggle) {
+                PostMessageW(g_mainWindow, kSingleKeyMessage, 0, 0);
+            }
+            if (result.suppress) {
                 return 1;
             }
         }
@@ -759,15 +754,12 @@ void RemoveSingleKeyHook() {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
     }
-    g_boundKeyIsDown = false;
+    g_singleKeyInput.CancelCapture();
 }
 
 bool InstallSingleKeyHook(std::wstring& errorMessage) {
-    if (g_hotkeyVirtualKey == 0U) {
+    if (g_keyboardHook != nullptr) {
         return true;
-    }
-    if (!SingleKeyIsAllowed(g_hotkeyVirtualKey, errorMessage)) {
-        return false;
     }
 
     SetLastError(ERROR_SUCCESS);
@@ -786,73 +778,97 @@ bool InstallSingleKeyHook(std::wstring& errorMessage) {
 }
 
 void SetHotkeyControlValue(const UINT virtualKey) {
+    g_pendingHotkeyVirtualKey = virtualKey;
     if (g_hotkeyControl != nullptr) {
-        SendMessageW(
-            g_hotkeyControl,
-            HKM_SETHOTKEY,
-            PackedHotkey(virtualKey),
-            0);
+        SetWindowTextW(g_hotkeyControl, gamma_changer::SingleKeyName(virtualKey).c_str());
     }
 }
 
 bool InstallLoadedSingleKey(std::wstring& errorMessage) {
-    SetHotkeyControlValue(g_hotkeyVirtualKey);
-    if (g_hotkeyVirtualKey == 0U) {
-        return true;
-    }
+    SetHotkeyControlValue(g_singleKeyInput.BoundKey());
+    // The hook also records modifier-only keys when no shortcut is saved yet.
     return InstallSingleKeyHook(errorMessage);
 }
 
+void BeginSingleKeyCapture(const HWND window) {
+    std::wstring error;
+    if (!InstallSingleKeyHook(error)) {
+        SetStatus(error, true);
+        return;
+    }
+    g_singleKeyInput.BeginCapture();
+    SetWindowTextW(window, L"Press one key...");
+}
+
+LRESULT CALLBACK SingleKeyControlProc(
+    const HWND window,
+    const UINT message,
+    const WPARAM wParam,
+    const LPARAM lParam,
+    const UINT_PTR subclassId,
+    DWORD_PTR) {
+    switch (message) {
+        case WM_SETFOCUS:
+            BeginSingleKeyCapture(window);
+            break;
+        case WM_LBUTTONDOWN:
+            if (GetFocus() == window) {
+                BeginSingleKeyCapture(window);
+            }
+            break;
+        case WM_KILLFOCUS:
+            g_singleKeyInput.CancelCapture();
+            SetHotkeyControlValue(g_pendingHotkeyVirtualKey);
+            break;
+        case WM_GETDLGCODE:
+            if (g_singleKeyInput.IsCapturing()) {
+                return DLGC_WANTALLKEYS;
+            }
+            break;
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            return 0;
+        case WM_NCDESTROY:
+            g_singleKeyInput.CancelCapture();
+            RemoveWindowSubclass(window, SingleKeyControlProc, subclassId);
+            break;
+        default:
+            break;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
 void SaveHotkeyFromControl() {
-    const WORD packed = static_cast<WORD>(
-        SendMessageW(g_hotkeyControl, HKM_GETHOTKEY, 0, 0));
-    const UINT requestedVirtualKey = LOBYTE(packed);
+    const UINT requestedVirtualKey = g_pendingHotkeyVirtualKey;
     std::wstring error;
     if (!SingleKeyIsAllowed(requestedVirtualKey, error)) {
         SetStatus(error, true);
         return;
     }
 
-    const UINT previousVirtualKey = g_hotkeyVirtualKey;
-    RemoveSingleKeyHook();
-    g_hotkeyVirtualKey = requestedVirtualKey;
-    if (!InstallSingleKeyHook(error)) {
-        g_hotkeyVirtualKey = previousVirtualKey;
-        std::wstring ignored;
-        InstallSingleKeyHook(ignored);
-        SetHotkeyControlValue(previousVirtualKey);
+    if (!InstallSingleKeyHook(error) || !SaveHotkeySettings(requestedVirtualKey, error)) {
         SetStatus(error, true);
         return;
     }
 
-    if (!SaveHotkeySettings(error)) {
-        RemoveSingleKeyHook();
-        g_hotkeyVirtualKey = previousVirtualKey;
-        std::wstring ignored;
-        InstallSingleKeyHook(ignored);
-        SetHotkeyControlValue(previousVirtualKey);
-        SetStatus(error, true);
-        return;
-    }
-
+    g_singleKeyInput.SetBinding(requestedVirtualKey);
+    g_singleKeyInput.CancelCapture();
     SetHotkeyControlValue(requestedVirtualKey);
     SetStatus(
-        L"Key saved · It works even while Shift, Ctrl, or Alt is held",
+        L"Single key saved · " + gamma_changer::SingleKeyName(requestedVirtualKey) +
+            L" toggles 3.00 ↔ 1.00",
         false);
 }
 
 void ClearSavedHotkey() {
-    const UINT previousVirtualKey = g_hotkeyVirtualKey;
-    g_hotkeyVirtualKey = 0U;
     std::wstring error;
-    if (!SaveHotkeySettings(error)) {
-        g_hotkeyVirtualKey = previousVirtualKey;
-        SetHotkeyControlValue(previousVirtualKey);
+    if (!SaveHotkeySettings(0U, error)) {
         SetStatus(error, true);
         return;
     }
 
-    RemoveSingleKeyHook();
+    g_singleKeyInput.SetBinding(0U);
+    g_singleKeyInput.CancelCapture();
     SetHotkeyControlValue(0U);
     SetStatus(L"Global gamma key cleared", false);
 }
@@ -1418,11 +1434,12 @@ void CreateMainControls() {
         SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
         kControlHotkeyLabel);
     g_hotkeyControl = CreateControl(
-        HOTKEY_CLASSW,
-        L"",
-        WS_TABSTOP,
+        L"EDIT",
+        L"Not set",
+        ES_READONLY | ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP,
         kControlHotkey,
         WS_EX_CLIENTEDGE);
+    SetWindowSubclass(g_hotkeyControl, SingleKeyControlProc, 1U, 0U);
     g_saveHotkey = CreateControl(
         L"BUTTON", L"Set key", BS_PUSHBUTTON | WS_TABSTOP, kControlSaveHotkey);
     g_clearHotkey = CreateControl(
@@ -1786,6 +1803,16 @@ LRESULT CALLBACK MainWindowProc(
             ToggleMaximumGamma();
             return 0;
 
+        case kKeyCapturedMessage:
+            SetHotkeyControlValue(g_pendingHotkeyVirtualKey);
+            if (GetForegroundWindow() == window && GetFocus() == g_hotkeyControl) {
+                SetStatus(
+                    L"Selected " + gamma_changer::SingleKeyName(g_pendingHotkeyVirtualKey) +
+                        L" · Click Set key to save",
+                    false);
+            }
+            return 0;
+
         case kTrayMessage:
             if (lParam == WM_LBUTTONDBLCLK || lParam == WM_LBUTTONUP) {
                 ShowMainWindow();
@@ -1889,7 +1916,7 @@ int APIENTRY wWinMain(
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);
-    commonControls.dwICC = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_HOTKEY_CLASS;
+    commonControls.dwICC = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&commonControls);
 
     g_backgroundBrush = CreateSolidBrush(RGB(247, 249, 252));

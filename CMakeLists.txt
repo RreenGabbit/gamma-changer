@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     GammaChanger
-    VERSION 1.2.2
+    VERSION 1.2.3
     DESCRIPTION "Native Windows hardware gamma-ramp utility"
     LANGUAGES CXX)
 
@@ -29,6 +29,8 @@ if(WIN32)
     add_executable(GammaChanger WIN32
         src/main.cpp
         src/resource.h
+        src/single_key.h
+        src/single_key_win32.h
         src/assets/flashbang.ico
         src/GammaChanger.rc)
     set_source_files_properties(src/GammaChanger.rc PROPERTIES
@@ -75,4 +77,18 @@ if(BUILD_TESTING)
         target_compile_options(gamma_math_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME gamma_math_tests COMMAND gamma_math_tests)
+
+    add_executable(single_key_tests tests/single_key_tests.cpp)
+    target_include_directories(single_key_tests PRIVATE src)
+    target_compile_features(single_key_tests PRIVATE cxx_std_17)
+    if(WIN32)
+        target_link_libraries(single_key_tests PRIVATE user32)
+        target_compile_definitions(single_key_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(MSVC)
+        target_compile_options(single_key_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(single_key_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME single_key_tests COMMAND single_key_tests)
 endif()
