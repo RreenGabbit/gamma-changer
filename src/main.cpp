@@ -168,6 +168,7 @@ UINT g_taskbarCreatedMessage = 0U;
 UINT g_hotkeyVirtualKey = 0U;
 HHOOK g_keyboardHook = nullptr;
 bool g_boundKeyIsDown = false;
+bool g_sliderApplyPending = false;
 
 std::wstring FormatSystemError(const DWORD error) {
     if (error == ERROR_SUCCESS) {
@@ -224,21 +225,13 @@ GammaRamp FromNativeRamp(const NativeGammaRamp& native) {
 }
 
 bool ReadDeviceRamp(
-    const std::wstring& deviceName,
+    HDC deviceContext,
     GammaRamp& ramp,
     std::wstring& errorMessage) {
-    HDC deviceContext = CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr);
-    if (deviceContext == nullptr) {
-        errorMessage = L"Could not open " + deviceName + L": " +
-                       FormatSystemError(GetLastError());
-        return false;
-    }
-
     NativeGammaRamp native{};
     SetLastError(ERROR_SUCCESS);
     const BOOL succeeded = GetDeviceGammaRamp(deviceContext, &native);
     const DWORD error = GetLastError();
-    DeleteDC(deviceContext);
     if (succeeded == FALSE) {
         errorMessage = L"The display driver does not expose a readable gamma ramp";
         if (error != ERROR_SUCCESS) {
@@ -249,6 +242,22 @@ bool ReadDeviceRamp(
 
     ramp = FromNativeRamp(native);
     return true;
+}
+
+bool ReadDeviceRamp(
+    const std::wstring& deviceName,
+    GammaRamp& ramp,
+    std::wstring& errorMessage) {
+    HDC deviceContext = CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr);
+    if (deviceContext == nullptr) {
+        errorMessage = L"Could not open " + deviceName + L": " +
+                       FormatSystemError(GetLastError());
+        return false;
+    }
+
+    const bool succeeded = ReadDeviceRamp(deviceContext, ramp, errorMessage);
+    DeleteDC(deviceContext);
+    return succeeded;
 }
 
 bool WriteDeviceRamp(
@@ -267,8 +276,8 @@ bool WriteDeviceRamp(
     SetLastError(ERROR_SUCCESS);
     const BOOL succeeded = SetDeviceGammaRamp(deviceContext, &native);
     const DWORD setError = GetLastError();
-    DeleteDC(deviceContext);
     if (succeeded == FALSE) {
+        DeleteDC(deviceContext);
         errorMessage = L"The display driver rejected the gamma ramp";
         if (setError != ERROR_SUCCESS) {
             errorMessage += L": " + FormatSystemError(setError);
@@ -276,8 +285,11 @@ bool WriteDeviceRamp(
         return false;
     }
 
+    // Verify through the context we already opened for this write.
     std::wstring readError;
-    if (!ReadDeviceRamp(deviceName, actual, readError)) {
+    const bool verified = ReadDeviceRamp(deviceContext, actual, readError);
+    DeleteDC(deviceContext);
+    if (!verified) {
         errorMessage = L"Windows accepted the gamma ramp, but it could not be verified. " +
                        readError;
         return false;
@@ -1187,7 +1199,7 @@ void ApplySliderValue() {
     const bool enabled = std::abs(gamma - 1.0) >= 0.0001;
     std::wstring error;
     if (!ApplyGammaToDisplay(display, gamma, enabled, error)) {
-        SetStatus(error, true);
+        UpdateSelectedDisplayUi();
         return;
     }
     SetWindowTextW(g_gammaValue, FormatGamma(display.gamma).c_str());
@@ -1200,12 +1212,25 @@ void ApplySliderValue() {
         false);
 }
 
+void CancelPendingSliderApply() {
+    KillTimer(g_mainWindow, kApplyTimerId);
+    g_sliderApplyPending = false;
+}
+
+void FlushPendingSliderApply() {
+    if (!g_sliderApplyPending) {
+        return;
+    }
+    CancelPendingSliderApply();
+    ApplySliderValue();
+}
+
 void ResetSelectedDisplay() {
     if (g_selectedDisplay < 0 ||
         g_selectedDisplay >= static_cast<int>(g_displays.size())) {
         return;
     }
-    KillTimer(g_mainWindow, kApplyTimerId);
+    CancelPendingSliderApply();
     g_updatingControls = true;
     SendMessageW(g_gammaSlider, TBM_SETPOS, TRUE, 100);
     SetWindowTextW(g_gammaValue, L"1.00");
@@ -1214,7 +1239,7 @@ void ResetSelectedDisplay() {
 }
 
 void ToggleMaximumGamma() {
-    KillTimer(g_mainWindow, kApplyTimerId);
+    CancelPendingSliderApply();
     if (g_selectedDisplay < 0 ||
         g_selectedDisplay >= static_cast<int>(g_displays.size())) {
         SetStatus(L"No display is selected for the gamma hotkey.", true);
@@ -1232,6 +1257,7 @@ void ToggleMaximumGamma() {
 }
 
 void ResetAllDisplays() {
+    CancelPendingSliderApply();
     std::wstring firstError;
     for (auto& display : g_displays) {
         if (!display.hasBaseline) {
@@ -1405,9 +1431,8 @@ void PaintCalibrationPattern(const HWND window) {
     HBITMAP bitmap = CreateCompatibleBitmap(destination, std::max(1, width), std::max(1, height));
     HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
 
-    HBRUSH background = CreateSolidBrush(RGB(255, 255, 255));
-    FillRect(buffer, &client, background);
-    DeleteObject(background);
+    FillRect(buffer, &client, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    const auto colorBrush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
 
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(214, 220, 228));
     HGDIOBJ oldPen = SelectObject(buffer, borderPen);
@@ -1437,12 +1462,12 @@ void PaintCalibrationPattern(const HWND window) {
         SelectClipRgn(buffer, circle);
         for (int x = centerX - radius; x <= centerX + radius; x += 2) {
             RECT stripe{x, centerY - radius, x + 2, centerY + radius + 1};
-            HBRUSH stripeBrush = CreateSolidBrush(
+            SetDCBrushColor(
+                buffer,
                 ((x - centerX + radius) / 2) % 2 == 0
                     ? RGB(72, 72, 72)
                     : RGB(184, 184, 184));
-            FillRect(buffer, &stripe, stripeBrush);
-            DeleteObject(stripeBrush);
+            FillRect(buffer, &stripe, colorBrush);
         }
         RestoreDC(buffer, savedDc);
         DeleteObject(circle);
@@ -1457,11 +1482,11 @@ void PaintCalibrationPattern(const HWND window) {
             centerY + radius + 1);
 
         const int dotRadius = std::max(7, radius / 3);
-        HBRUSH dotBrush = CreateSolidBrush(RGB(
+        SetDCBrushColor(buffer, RGB(
             centerGray[static_cast<std::size_t>(target)],
             centerGray[static_cast<std::size_t>(target)],
             centerGray[static_cast<std::size_t>(target)]));
-        SelectObject(buffer, dotBrush);
+        SelectObject(buffer, colorBrush);
         Ellipse(
             buffer,
             centerX - dotRadius,
@@ -1469,7 +1494,6 @@ void PaintCalibrationPattern(const HWND window) {
             centerX + dotRadius + 1,
             centerY + dotRadius + 1);
         SelectObject(buffer, GetStockObject(NULL_BRUSH));
-        DeleteObject(dotBrush);
 
         RECT captionRect{
             centerX - radius - 12,
@@ -1600,26 +1624,41 @@ LRESULT CALLBACK MainWindowProc(
 
         case WM_HSCROLL:
             if (reinterpret_cast<HWND>(lParam) == g_gammaSlider && !g_updatingControls) {
+                const int scrollCode = LOWORD(wParam);
+                if (scrollCode == TB_ENDTRACK) {
+                    // A release can follow THUMBPOSITION or a completed debounce.
+                    // Only apply if there is still an outstanding change.
+                    FlushPendingSliderApply();
+                    return 0;
+                }
                 const double gamma = SliderGamma();
                 SetWindowTextW(g_gammaValue, FormatGamma(gamma).c_str());
-                KillTimer(window, kApplyTimerId);
-                const int scrollCode = LOWORD(wParam);
-                if (scrollCode == TB_ENDTRACK || scrollCode == TB_THUMBPOSITION) {
-                    ApplySliderValue();
-                } else {
-                    SetTimer(window, kApplyTimerId, 90U, nullptr);
+                CancelPendingSliderApply();
+                if (g_selectedDisplay >= 0 &&
+                    g_selectedDisplay < static_cast<int>(g_displays.size())) {
+                    const DisplayState& display =
+                        g_displays[static_cast<std::size_t>(g_selectedDisplay)];
+                    const double appliedGamma = display.enabled ? display.gamma : 1.0;
+                    if (display.lastError.empty() && gamma == appliedGamma) {
+                        return 0;
+                    }
+                }
+                g_sliderApplyPending = true;
+                if (scrollCode == TB_THUMBPOSITION ||
+                    SetTimer(window, kApplyTimerId, 90U, nullptr) == 0U) {
+                    FlushPendingSliderApply();
                 }
             }
             return 0;
 
         case WM_TIMER:
             if (wParam == kApplyTimerId) {
-                KillTimer(window, kApplyTimerId);
-                ApplySliderValue();
+                FlushPendingSliderApply();
                 return 0;
             }
             if (wParam == kDisplayRefreshTimerId) {
                 KillTimer(window, kDisplayRefreshTimerId);
+                FlushPendingSliderApply();
                 RefreshDisplays(true);
                 PopulateDisplayCombo();
                 UpdateSelectedDisplayUi();
@@ -1641,6 +1680,7 @@ LRESULT CALLBACK MainWindowProc(
                         0);
                     if (data != CB_ERR && data >= 0 &&
                         data < static_cast<LRESULT>(g_displays.size())) {
+                        FlushPendingSliderApply();
                         g_selectedDisplay = static_cast<int>(data);
                         SaveSelectedDevice(
                             g_displays[static_cast<std::size_t>(g_selectedDisplay)].deviceName);
@@ -1691,6 +1731,7 @@ LRESULT CALLBACK MainWindowProc(
                 return 0;
             }
             if (identifier == kMenuExit) {
+                FlushPendingSliderApply();
                 DestroyWindow(window);
                 return 0;
             }
@@ -1735,11 +1776,12 @@ LRESULT CALLBACK MainWindowProc(
             return 0;
 
         case WM_CLOSE:
+            FlushPendingSliderApply();
             DestroyWindow(window);
             return 0;
 
         case WM_DESTROY:
-            KillTimer(window, kApplyTimerId);
+            CancelPendingSliderApply();
             KillTimer(window, kDisplayRefreshTimerId);
             WTSUnRegisterSessionNotification(window);
             RemoveSingleKeyHook();
@@ -1841,7 +1883,7 @@ int APIENTRY wWinMain(
         WS_EX_CONTROLPARENT,
         kWindowClassName,
         kWindowTitle,
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         width,

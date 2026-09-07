@@ -32,17 +32,20 @@ GammaRamp ApplyRelativeGamma(const GammaRamp& baseline, const double requestedGa
 
     GammaRamp result{};
     constexpr double lastIndex = static_cast<double>(kGammaRampEntries - 1U);
+    const double inverseGamma = 1.0 / gamma;
 
-    for (std::size_t channelIndex = 0; channelIndex < kGammaRampChannels; ++channelIndex) {
-        const auto& source = baseline.channels[channelIndex];
-        auto& destination = result.channels[channelIndex];
+    // All channels sample the same positions. Compute the power curve and
+    // interpolation weights once per entry, preserving each channel's baseline.
+    for (std::size_t index = 0; index < kGammaRampEntries; ++index) {
+        const double normalized = static_cast<double>(index) / lastIndex;
+        const double sourcePosition = std::pow(normalized, inverseGamma) * lastIndex;
+        const auto lower = static_cast<std::size_t>(std::floor(sourcePosition));
+        const auto upper = std::min(lower + 1U, kGammaRampEntries - 1U);
+        const double fraction = sourcePosition - static_cast<double>(lower);
 
-        for (std::size_t index = 0; index < kGammaRampEntries; ++index) {
-            const double normalized = static_cast<double>(index) / lastIndex;
-            const double sourcePosition = std::pow(normalized, 1.0 / gamma) * lastIndex;
-            const auto lower = static_cast<std::size_t>(std::floor(sourcePosition));
-            const auto upper = std::min(lower + 1U, kGammaRampEntries - 1U);
-            const double fraction = sourcePosition - static_cast<double>(lower);
+        for (std::size_t channelIndex = 0; channelIndex < kGammaRampChannels; ++channelIndex) {
+            const auto& source = baseline.channels[channelIndex];
+            auto& destination = result.channels[channelIndex];
             const double interpolated =
                 static_cast<double>(source[lower]) * (1.0 - fraction) +
                 static_cast<double>(source[upper]) * fraction;

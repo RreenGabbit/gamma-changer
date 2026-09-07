@@ -1,5 +1,7 @@
 #include "gamma_math.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -79,6 +81,88 @@ void TestClamping() {
         "non-finite gamma becomes neutral");
 }
 
+void TestCalibratedInterpolation() {
+    // Distinct piecewise-linear calibrations exercise interpolation, clipping,
+    // plateaus, and nonzero black points without deriving the expected values
+    // from the implementation's sample-index calculation.
+    GammaRamp baseline{};
+    for (std::size_t index = 0; index < gamma_changer::kGammaRampEntries; ++index) {
+        baseline.channels[0][index] = static_cast<std::uint16_t>(
+            100U + std::min(index, std::size_t{128}) * 400U);
+        baseline.channels[1][index] = static_cast<std::uint16_t>(3000U + index * 200U);
+        baseline.channels[2][index] = static_cast<std::uint16_t>(
+            4096U + (index > 96U ? (index - 96U) * 300U : 0U));
+    }
+
+    for (int step = 50; step <= 300; ++step) {
+        const double gamma = static_cast<double>(step) / 100.0;
+        const GammaRamp adjusted = ApplyRelativeGamma(baseline, gamma);
+        Require(IsMonotonic(adjusted), "calibrated curves remain monotonic at every gamma");
+        for (std::size_t channel = 0; channel < gamma_changer::kGammaRampChannels; ++channel) {
+            Require(
+                adjusted.channels[channel].front() == baseline.channels[channel].front() &&
+                    adjusted.channels[channel].back() == baseline.channels[channel].back(),
+                "correction preserves each channel's calibrated black and white points");
+        }
+        for (std::size_t index = 0; index < gamma_changer::kGammaRampEntries; ++index) {
+            const long double position =
+                std::pow(static_cast<long double>(index) / 255.0L, 1.0L / gamma) * 255.0L;
+            const std::array<long double, 3> expected = {
+                100.0L + std::min(position, 128.0L) * 400.0L,
+                3000.0L + position * 200.0L,
+                4096.0L + std::max(position - 96.0L, 0.0L) * 300.0L,
+            };
+            for (std::size_t channel = 0; channel < expected.size(); ++channel) {
+                Require(
+                    std::abs(static_cast<long>(adjusted.channels[channel][index]) -
+                             std::lround(expected[channel])) <= 1L,
+                    "all RGB channels follow their own calibrated curve within rounding");
+            }
+        }
+    }
+}
+
+void TestInvalidGammaPreservesBaseline() {
+    GammaRamp baseline = MakeIdentityRamp();
+    baseline.channels[0][63] = 12345U;
+    baseline.channels[1][127] = 30001U;
+    baseline.channels[2][191] = 50002U;
+    const std::array<double, 3> invalid = {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const double gamma : invalid) {
+        Require(
+            RampsApproximatelyEqual(baseline, ApplyRelativeGamma(baseline, gamma), 0U),
+            "invalid gamma returns the exact calibration baseline");
+    }
+    Require(
+        RampsApproximatelyEqual(
+            ApplyRelativeGamma(baseline, 0.01),
+            ApplyRelativeGamma(baseline, gamma_changer::kMinimumGamma),
+            0U),
+        "out-of-range darkening matches the minimum gamma");
+    Require(
+        RampsApproximatelyEqual(
+            ApplyRelativeGamma(baseline, 99.0),
+            ApplyRelativeGamma(baseline, gamma_changer::kMaximumGamma),
+            0U),
+        "out-of-range brightening matches the maximum gamma");
+}
+
+void TestReadbackTolerance() {
+    const GammaRamp baseline = MakeIdentityRamp();
+    GammaRamp actual = baseline;
+    actual.channels[2][254] -= 1024U;
+    Require(RampsApproximatelyEqual(baseline, actual), "readback accepts the tolerance boundary");
+    Require(RampsApproximatelyEqual(actual, baseline), "readback tolerance is symmetric");
+    Require(!RampsApproximatelyEqual(baseline, actual, 0U), "exact comparison rejects quantization");
+    --actual.channels[2][254];
+    Require(!RampsApproximatelyEqual(baseline, actual), "readback rejects changes beyond tolerance");
+    Require(!RampsApproximatelyEqual(actual, baseline), "readback rejects differences in either direction");
+}
+
 void TestWindowsSafetyEnvelope() {
     const GammaRamp identity = MakeIdentityRamp();
     for (int step = 50; step <= 300; ++step) {
@@ -106,6 +190,9 @@ int main() {
     TestDirectionAndEndpoints();
     TestKnownMidpoint();
     TestClamping();
+    TestCalibratedInterpolation();
+    TestInvalidGammaPreservesBaseline();
+    TestReadbackTolerance();
     TestWindowsSafetyEnvelope();
     std::cout << "gamma_math_tests: all tests passed\n";
     return 0;
