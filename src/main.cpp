@@ -12,10 +12,10 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cwctype>
+#include <locale>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "gamma_math.h"
+#include "gamma_toggle.h"
 #include "resource.h"
 #include "single_key.h"
 #include "single_key_win32.h"
@@ -34,12 +35,8 @@ using gamma_changer::GammaRamp;
 using gamma_changer::RampsApproximatelyEqual;
 
 constexpr wchar_t kWindowClassName[] = L"GammaChanger.MainWindow";
-constexpr wchar_t kPatternClassName[] = L"GammaChanger.CalibrationPattern";
 constexpr wchar_t kWindowTitle[] = L"Gamma Changer";
 constexpr wchar_t kAppRegistryPath[] = L"Software\\GammaChanger";
-constexpr wchar_t kRunRegistryPath[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kRunValueName[] = L"GammaChanger";
 constexpr wchar_t kSingleInstanceName[] = L"Local\\GammaChanger.SingleInstance.v1";
 
 constexpr UINT kTrayIconId = 1U;
@@ -50,24 +47,18 @@ constexpr UINT kKeyCapturedMessage = WM_APP + 4U;
 constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 
-constexpr int kControlHeader = 1001;
-constexpr int kControlSubtitle = 1002;
 constexpr int kControlDisplayLabel = 1003;
 constexpr int kControlDisplayCombo = 1004;
 constexpr int kControlGammaLabel = 1005;
 constexpr int kControlGammaValue = 1006;
 constexpr int kControlGammaSlider = 1007;
-constexpr int kControlMinimumLabel = 1008;
-constexpr int kControlMaximumLabel = 1009;
-constexpr int kControlPattern = 1010;
-constexpr int kControlHint = 1011;
-constexpr int kControlStartup = 1012;
-constexpr int kControlReset = 1013;
-constexpr int kControlStatus = 1014;
 constexpr int kControlHotkeyLabel = 1015;
 constexpr int kControlHotkey = 1016;
-constexpr int kControlSaveHotkey = 1017;
 constexpr int kControlClearHotkey = 1018;
+
+constexpr int kControlToggleLabel = 1019;
+constexpr int kControlToggleFirst = 1020;
+constexpr int kControlToggleSecond = 1021;
 
 constexpr int kMenuOpen = 2001;
 constexpr int kMenuResetAllAndExit = 2002;
@@ -144,51 +135,38 @@ struct PersistentDisplaySettings {
     bool hasLastApplied = false;
 };
 
-struct DisplayState {
+struct DisplayState : PersistentDisplaySettings {
     std::wstring deviceName;
     std::wstring label;
     bool primary = false;
     int width = 0;
     int height = 0;
     bool rampReadable = false;
-    double gamma = 1.0;
-    bool enabled = false;
-    GammaRamp baseline{};
-    GammaRamp lastApplied{};
-    bool hasBaseline = false;
-    bool hasLastApplied = false;
+    bool automaticReapplyPaused = false;
     std::wstring lastError;
 };
 
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
-HWND g_header = nullptr;
-HWND g_subtitle = nullptr;
 HWND g_displayLabel = nullptr;
 HWND g_displayCombo = nullptr;
 HWND g_gammaLabel = nullptr;
 HWND g_gammaValue = nullptr;
 HWND g_gammaSlider = nullptr;
-HWND g_minimumLabel = nullptr;
-HWND g_maximumLabel = nullptr;
-HWND g_pattern = nullptr;
-HWND g_hint = nullptr;
-HWND g_startup = nullptr;
-HWND g_reset = nullptr;
-HWND g_status = nullptr;
 HWND g_hotkeyLabel = nullptr;
 HWND g_hotkeyControl = nullptr;
-HWND g_saveHotkey = nullptr;
 HWND g_clearHotkey = nullptr;
-HFONT g_headerFont = nullptr;
+HWND g_toggleLabel = nullptr;
+HWND g_toggleFirst = nullptr;
+HWND g_toggleSecond = nullptr;
+double g_toggleFirstGamma = 1.0;
+double g_toggleSecondGamma = 3.0;
 HFONT g_valueFont = nullptr;
 HFONT g_bodyFont = nullptr;
-HFONT g_smallFont = nullptr;
 HBRUSH g_backgroundBrush = nullptr;
 std::vector<DisplayState> g_displays;
 int g_selectedDisplay = -1;
 bool g_updatingControls = false;
-bool g_statusIsError = false;
 bool g_trayIconAdded = false;
 UINT g_taskbarCreatedMessage = 0U;
 gamma_changer::SingleKeyInput g_singleKeyInput;
@@ -226,6 +204,7 @@ std::wstring FormatSystemError(const DWORD error) {
 
 std::wstring FormatGamma(const double gamma) {
     std::wostringstream stream;
+    stream.imbue(std::locale::classic());
     stream << std::fixed << std::setprecision(2) << gamma;
     return stream.str();
 }
@@ -532,6 +511,14 @@ void LoadHotkeySettings() {
         return;
     }
 
+    DWORD value = 0U;
+    if (ReadDword(key.value, L"ToggleFirstGammaMilli", value)) {
+        g_toggleFirstGamma = gamma_changer::ClampGamma(value / 1000.0);
+    }
+    if (ReadDword(key.value, L"ToggleSecondGammaMilli", value)) {
+        g_toggleSecondGamma = gamma_changer::ClampGamma(value / 1000.0);
+    }
+
     DWORD virtualKey = 0U;
     if (ReadDword(key.value, L"HotkeyVirtualKey", virtualKey)) {
         g_singleKeyInput.SetBinding(virtualKey);
@@ -557,77 +544,6 @@ bool SaveHotkeySettings(const DWORD virtualKey, std::wstring& errorMessage) {
     }
     // Combination settings are obsolete; only the single virtual key is used.
     RegDeleteValueW(key.value, L"HotkeyFlags");
-    return true;
-}
-
-std::wstring GetExecutablePath() {
-    std::vector<wchar_t> buffer(512U);
-    for (;;) {
-        const DWORD length = GetModuleFileNameW(
-            nullptr,
-            buffer.data(),
-            static_cast<DWORD>(buffer.size()));
-        if (length == 0U) {
-            return {};
-        }
-        if (length < buffer.size()) {
-            return std::wstring(buffer.data(), length);
-        }
-        buffer.resize(buffer.size() * 2U);
-    }
-}
-
-bool IsStartupEnabled() {
-    auto key = OpenRegistryKey(kRunRegistryPath, KEY_QUERY_VALUE, false);
-    if (!key) {
-        return false;
-    }
-    DWORD type = 0;
-    DWORD bytes = 0;
-    return RegQueryValueExW(
-               key.value,
-               kRunValueName,
-               nullptr,
-               &type,
-               nullptr,
-               &bytes) == ERROR_SUCCESS &&
-           type == REG_SZ && bytes > sizeof(wchar_t);
-}
-
-bool SetStartupEnabled(const bool enabled, std::wstring& errorMessage) {
-    auto key = OpenRegistryKey(kRunRegistryPath, KEY_SET_VALUE, true);
-    if (!key) {
-        errorMessage = L"Could not open the current user's Startup registry key.";
-        return false;
-    }
-
-    LSTATUS status = ERROR_SUCCESS;
-    if (enabled) {
-        const std::wstring executable = GetExecutablePath();
-        if (executable.empty()) {
-            errorMessage = L"Could not find the application executable.";
-            return false;
-        }
-        const std::wstring command = L"\"" + executable + L"\" --background";
-        const DWORD bytes = static_cast<DWORD>((command.size() + 1U) * sizeof(wchar_t));
-        status = RegSetValueExW(
-            key.value,
-            kRunValueName,
-            0,
-            REG_SZ,
-            reinterpret_cast<const BYTE*>(command.c_str()),
-            bytes);
-    } else {
-        status = RegDeleteValueW(key.value, kRunValueName);
-        if (status == ERROR_FILE_NOT_FOUND) {
-            status = ERROR_SUCCESS;
-        }
-    }
-
-    if (status != ERROR_SUCCESS) {
-        errorMessage = L"Could not update Startup: " + FormatSystemError(status);
-        return false;
-    }
     return true;
 }
 
@@ -703,12 +619,16 @@ std::vector<DisplayState> EnumerateDisplays() {
     return displays;
 }
 
-void SetStatus(const std::wstring& message, const bool error) {
-    g_statusIsError = error;
-    if (g_status != nullptr) {
-        SetWindowTextW(g_status, message.c_str());
-        InvalidateRect(g_status, nullptr, TRUE);
-    }
+void ReportError(const std::wstring& message) {
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_mainWindow;
+    data.uID = kTrayIconId;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_ERROR;
+    lstrcpynW(data.szInfoTitle, kWindowTitle, ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
 bool SingleKeyIsAllowed(const UINT virtualKey, std::wstring& errorMessage) {
@@ -793,7 +713,7 @@ bool InstallLoadedSingleKey(std::wstring& errorMessage) {
 void BeginSingleKeyCapture(const HWND window) {
     std::wstring error;
     if (!InstallSingleKeyHook(error)) {
-        SetStatus(error, true);
+        ReportError(error);
         return;
     }
     g_singleKeyInput.BeginCapture();
@@ -842,35 +762,32 @@ void SaveHotkeyFromControl() {
     const UINT requestedVirtualKey = g_pendingHotkeyVirtualKey;
     std::wstring error;
     if (!SingleKeyIsAllowed(requestedVirtualKey, error)) {
-        SetStatus(error, true);
+        ReportError(error);
         return;
     }
 
     if (!InstallSingleKeyHook(error) || !SaveHotkeySettings(requestedVirtualKey, error)) {
-        SetStatus(error, true);
+        SetHotkeyControlValue(g_singleKeyInput.BoundKey());
+        ReportError(error);
         return;
     }
 
     g_singleKeyInput.SetBinding(requestedVirtualKey);
     g_singleKeyInput.CancelCapture();
     SetHotkeyControlValue(requestedVirtualKey);
-    SetStatus(
-        L"Single key saved · " + gamma_changer::SingleKeyName(requestedVirtualKey) +
-            L" toggles 3.00 ↔ 1.00",
-        false);
+    SetFocus(g_gammaSlider);
 }
 
 void ClearSavedHotkey() {
     std::wstring error;
     if (!SaveHotkeySettings(0U, error)) {
-        SetStatus(error, true);
+        ReportError(error);
         return;
     }
 
     g_singleKeyInput.SetBinding(0U);
     g_singleKeyInput.CancelCapture();
     SetHotkeyControlValue(0U);
-    SetStatus(L"Global gamma key cleared", false);
 }
 
 bool ApplyGammaToDisplay(
@@ -881,43 +798,26 @@ bool ApplyGammaToDisplay(
     if (!display.hasBaseline) {
         errorMessage = L"No readable baseline gamma ramp is available for this display.";
         display.lastError = errorMessage;
+        display.automaticReapplyPaused = true;
         return false;
     }
 
-    const double gamma = gamma_changer::ClampGamma(requestedGamma);
-    const GammaRamp target = enabled ? ApplyRelativeGamma(display.baseline, gamma)
-                                     : display.baseline;
+    const double gamma = enabled ? gamma_changer::ClampGamma(requestedGamma) : 1.0;
+    const GammaRamp target = ApplyRelativeGamma(display.baseline, gamma);
     GammaRamp actual{};
     if (!WriteDeviceRamp(display.deviceName, target, actual, errorMessage)) {
+        // Readback can be delayed or overwritten. A second write to the baseline
+        // can cause a bright flash followed by an immediate return.
         display.lastError = errorMessage;
-        if (enabled) {
-            GammaRamp restored{};
-            std::wstring restoreError;
-            if (WriteDeviceRamp(
-                    display.deviceName,
-                    display.baseline,
-                    restored,
-                    restoreError)) {
-                display.gamma = 1.0;
-                display.enabled = false;
-                display.lastApplied = restored;
-                display.hasLastApplied = true;
-                display.rampReadable = true;
-                SaveDisplaySettings(display);
-                errorMessage += L" The captured Windows calibration was restored.";
-                display.lastError = errorMessage;
-            } else {
-                errorMessage += L" Automatic restoration also failed: " + restoreError;
-                display.lastError = errorMessage;
-            }
-        }
+        display.automaticReapplyPaused = true;
         return false;
     }
 
-    display.gamma = enabled ? gamma : 1.0;
+    display.gamma = gamma;
     display.enabled = enabled;
     display.lastApplied = actual;
     display.hasLastApplied = true;
+    display.automaticReapplyPaused = false;
     display.rampReadable = true;
     display.lastError.clear();
     SaveDisplaySettings(display);
@@ -951,6 +851,7 @@ void RefreshDisplays(const bool reapplySavedSettings) {
             display.hasBaseline = previous->hasBaseline;
             display.hasLastApplied = previous->hasLastApplied;
             display.lastError = previous->lastError;
+            display.automaticReapplyPaused = previous->automaticReapplyPaused;
         } else {
             const PersistentDisplaySettings saved = LoadDisplaySettings(display.deviceName);
             display.gamma = saved.gamma;
@@ -984,22 +885,18 @@ void RefreshDisplays(const bool reapplySavedSettings) {
         }
         if (!display.rampReadable) {
             display.lastError = readError;
-        } else if (!display.enabled) {
+        } else if (!display.automaticReapplyPaused) {
             display.lastError.clear();
+            const bool stillApplied = display.hasLastApplied &&
+                RampsApproximatelyEqual(current, display.lastApplied, 0U);
+            if (reapplySavedSettings && display.enabled && !stillApplied) {
+                std::wstring error;
+                ApplyGammaToDisplay(display, display.gamma, true, error);
+            }
         }
     }
 
     g_displays = std::move(refreshed);
-
-    if (reapplySavedSettings) {
-        for (auto& display : g_displays) {
-            if (!display.enabled) {
-                continue;
-            }
-            std::wstring error;
-            ApplyGammaToDisplay(display, display.gamma, true, error);
-        }
-    }
 
     g_selectedDisplay = -1;
     for (std::size_t index = 0; index < g_displays.size(); ++index) {
@@ -1011,7 +908,6 @@ void RefreshDisplays(const bool reapplySavedSettings) {
     if (g_selectedDisplay < 0 && !g_displays.empty()) {
         g_selectedDisplay = 0;
     }
-
 }
 
 int ScaleForDpi(const HWND window, const int value) {
@@ -1045,112 +941,41 @@ void AssignFont(const HWND control, const HFONT font) {
 }
 
 void RecreateFonts() {
-    HFONT newHeader = CreateUiFont(g_mainWindow, 23, FW_SEMIBOLD);
-    HFONT newValue = CreateUiFont(g_mainWindow, 21, FW_SEMIBOLD);
     HFONT newBody = CreateUiFont(g_mainWindow, 10, FW_NORMAL);
-    HFONT newSmall = CreateUiFont(g_mainWindow, 9, FW_NORMAL);
-
-    AssignFont(g_header, newHeader);
-    AssignFont(g_gammaValue, newValue);
-    const std::array<HWND, 12> bodyControls = {
-        g_subtitle,
-        g_displayLabel,
-        g_displayCombo,
-        g_gammaLabel,
-        g_hotkeyLabel,
-        g_hotkeyControl,
-        g_saveHotkey,
-        g_clearHotkey,
-        g_startup,
-        g_reset,
-        g_status,
-        g_hint,
-    };
-    for (const HWND control : bodyControls) {
+    HFONT newValue = CreateUiFont(g_mainWindow, 16, FW_SEMIBOLD);
+    for (HWND control : {g_displayLabel, g_displayCombo, g_gammaLabel,
+                         g_hotkeyLabel, g_hotkeyControl, g_clearHotkey,
+                         g_toggleLabel, g_toggleFirst, g_toggleSecond}) {
         AssignFont(control, newBody);
     }
-    AssignFont(g_minimumLabel, newSmall);
-    AssignFont(g_maximumLabel, newSmall);
-
-    if (g_headerFont != nullptr) {
-        DeleteObject(g_headerFont);
-    }
-    if (g_valueFont != nullptr) {
-        DeleteObject(g_valueFont);
-    }
-    if (g_bodyFont != nullptr) {
-        DeleteObject(g_bodyFont);
-    }
-    if (g_smallFont != nullptr) {
-        DeleteObject(g_smallFont);
-    }
-    g_headerFont = newHeader;
-    g_valueFont = newValue;
+    AssignFont(g_gammaValue, newValue);
+    if (g_bodyFont != nullptr) DeleteObject(g_bodyFont);
+    if (g_valueFont != nullptr) DeleteObject(g_valueFont);
     g_bodyFont = newBody;
-    g_smallFont = newSmall;
-    InvalidateRect(g_pattern, nullptr, TRUE);
+    g_valueFont = newValue;
 }
 
 void LayoutControls() {
-    if (g_mainWindow == nullptr) {
-        return;
-    }
-
     RECT client{};
     GetClientRect(g_mainWindow, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    const int margin = ScaleForDpi(g_mainWindow, 32);
-    const int contentWidth = std::max(1, width - margin * 2);
-    const int patternY = ScaleForDpi(g_mainWindow, 306);
-    const int bottomRowY = height - ScaleForDpi(g_mainWindow, 69);
-    const int hotkeyRowY = bottomRowY - ScaleForDpi(g_mainWindow, 42);
-    const int statusY = height - ScaleForDpi(g_mainWindow, 30);
-    const int patternHeight = std::max(
-        ScaleForDpi(g_mainWindow, 122),
-        hotkeyRowY - ScaleForDpi(g_mainWindow, 58) - patternY);
-    const int clearWidth = ScaleForDpi(g_mainWindow, 66);
-    const int saveWidth = ScaleForDpi(g_mainWindow, 82);
-    const int hotkeyWidth = ScaleForDpi(g_mainWindow, 150);
-    const int smallGap = ScaleForDpi(g_mainWindow, 8);
-    const int clearX = margin + contentWidth - clearWidth;
-    const int saveX = clearX - smallGap - saveWidth;
-    const int hotkeyX = saveX - smallGap - hotkeyWidth;
-
-    MoveWindow(g_header, margin, ScaleForDpi(g_mainWindow, 20), contentWidth,
-               ScaleForDpi(g_mainWindow, 39), TRUE);
-    MoveWindow(g_subtitle, margin, ScaleForDpi(g_mainWindow, 61), contentWidth,
-               ScaleForDpi(g_mainWindow, 39), TRUE);
-    MoveWindow(g_displayLabel, margin, ScaleForDpi(g_mainWindow, 124), contentWidth,
-               ScaleForDpi(g_mainWindow, 22), TRUE);
-    MoveWindow(g_displayCombo, margin, ScaleForDpi(g_mainWindow, 150), contentWidth,
-               ScaleForDpi(g_mainWindow, 220), TRUE);
-    MoveWindow(g_gammaLabel, margin, ScaleForDpi(g_mainWindow, 204), contentWidth / 2,
-               ScaleForDpi(g_mainWindow, 24), TRUE);
-    MoveWindow(g_gammaValue, margin + contentWidth / 2, ScaleForDpi(g_mainWindow, 194),
-               contentWidth / 2, ScaleForDpi(g_mainWindow, 42), TRUE);
-    MoveWindow(g_gammaSlider, margin, ScaleForDpi(g_mainWindow, 230), contentWidth,
-               ScaleForDpi(g_mainWindow, 45), TRUE);
-    MoveWindow(g_minimumLabel, margin, ScaleForDpi(g_mainWindow, 274), contentWidth / 2,
-               ScaleForDpi(g_mainWindow, 20), TRUE);
-    MoveWindow(g_maximumLabel, margin + contentWidth / 2, ScaleForDpi(g_mainWindow, 274),
-               contentWidth / 2, ScaleForDpi(g_mainWindow, 20), TRUE);
-    MoveWindow(g_pattern, margin, patternY, contentWidth, patternHeight, TRUE);
-    MoveWindow(g_hint, margin, patternY + patternHeight + ScaleForDpi(g_mainWindow, 8),
-               contentWidth, ScaleForDpi(g_mainWindow, 42), TRUE);
-    MoveWindow(g_hotkeyLabel, margin, hotkeyRowY,
-               std::max(1, hotkeyX - margin - smallGap), ScaleForDpi(g_mainWindow, 32), TRUE);
-    MoveWindow(g_hotkeyControl, hotkeyX, hotkeyRowY, hotkeyWidth,
-               ScaleForDpi(g_mainWindow, 30), TRUE);
-    MoveWindow(g_saveHotkey, saveX, hotkeyRowY, saveWidth,
-               ScaleForDpi(g_mainWindow, 30), TRUE);
-    MoveWindow(g_clearHotkey, clearX, hotkeyRowY, clearWidth,
-               ScaleForDpi(g_mainWindow, 30), TRUE);
-    MoveWindow(g_startup, margin, bottomRowY, contentWidth - ScaleForDpi(g_mainWindow, 176),
-               ScaleForDpi(g_mainWindow, 34), TRUE);
-    MoveWindow(g_reset, margin + contentWidth - ScaleForDpi(g_mainWindow, 164), bottomRowY,
-               ScaleForDpi(g_mainWindow, 164), ScaleForDpi(g_mainWindow, 34), TRUE);
-    MoveWindow(g_status, margin, statusY, contentWidth, ScaleForDpi(g_mainWindow, 22), TRUE);
+    const auto scale = [](int value) { return ScaleForDpi(g_mainWindow, value); };
+    const int margin = scale(20);
+    const int width = std::max(1, static_cast<int>(client.right) - 2 * margin);
+    const auto move = [&](HWND control, int x, int y, int w, int h) {
+        MoveWindow(control, x, scale(y), w, scale(h), TRUE);
+    };
+    move(g_displayLabel, margin, 18, width, 22);
+    move(g_displayCombo, margin, 44, width, 220);
+    move(g_gammaLabel, margin, 88, width / 2, 26);
+    move(g_gammaValue, margin + width / 2, 82, width / 2, 32);
+    move(g_gammaSlider, margin, 118, width, 36);
+    move(g_hotkeyLabel, margin, 174, scale(100), 28);
+    move(g_hotkeyControl, margin + scale(104), 174, width - scale(176), 28);
+    move(g_clearHotkey, margin + width - scale(64), 174, scale(64), 28);
+    move(g_toggleLabel, margin, 218, scale(100), 28);
+    const int fieldWidth = (width - scale(116)) / 2;
+    move(g_toggleFirst, margin + scale(104), 218, fieldWidth, 28);
+    move(g_toggleSecond, margin + scale(116) + fieldWidth, 218, fieldWidth, 28);
 }
 
 void PopulateDisplayCombo() {
@@ -1182,11 +1007,10 @@ void UpdateSelectedDisplayUi() {
         g_selectedDisplay >= 0 && g_selectedDisplay < static_cast<int>(g_displays.size());
     EnableWindow(g_displayCombo, hasDisplay ? TRUE : FALSE);
     EnableWindow(g_gammaSlider, hasDisplay ? TRUE : FALSE);
-    EnableWindow(g_reset, hasDisplay ? TRUE : FALSE);
 
     if (!hasDisplay) {
         SetWindowTextW(g_gammaValue, L"—");
-        SetStatus(L"No active desktop display was found.", true);
+        ReportError(L"No active desktop display was found.");
         g_updatingControls = false;
         return;
     }
@@ -1198,27 +1022,17 @@ void UpdateSelectedDisplayUi() {
         TBM_SETPOS,
         TRUE,
         static_cast<LPARAM>(std::lround(gamma * 100.0)));
-    SetWindowTextW(g_gammaValue, FormatGamma(gamma).c_str());
+    SetWindowTextW(g_gammaValue, display.automaticReapplyPaused ? L"—" : FormatGamma(gamma).c_str());
 
     if (!display.lastError.empty()) {
-        SetStatus(display.lastError, true);
+        ReportError(display.lastError);
         if (!display.rampReadable || !display.hasBaseline) {
             EnableWindow(g_gammaSlider, FALSE);
-            EnableWindow(g_reset, FALSE);
         }
     } else if (!display.rampReadable || !display.hasBaseline) {
-        SetStatus(
-            L"This display driver does not provide a usable SDR hardware gamma ramp.",
-            true);
+        ReportError(
+            L"This display driver does not provide a usable SDR hardware gamma ramp.");
         EnableWindow(g_gammaSlider, FALSE);
-        EnableWindow(g_reset, FALSE);
-    } else if (display.enabled) {
-        SetStatus(
-            L"Active · Windows hardware gamma ramp applied at " +
-                FormatGamma(display.gamma),
-            false);
-    } else {
-        SetStatus(L"System calibration is active · Gamma correction 1.00", false);
     }
     g_updatingControls = false;
 }
@@ -1243,12 +1057,6 @@ void ApplySliderValue() {
     }
     SetWindowTextW(g_gammaValue, FormatGamma(display.gamma).c_str());
     SaveSelectedDevice(display.deviceName);
-    SetStatus(
-        display.enabled
-            ? L"Active · Windows hardware gamma ramp applied at " +
-                  FormatGamma(display.gamma)
-            : L"System calibration restored · Gamma correction 1.00",
-        false);
 }
 
 void CancelPendingSliderApply() {
@@ -1264,34 +1072,20 @@ void FlushPendingSliderApply() {
     ApplySliderValue();
 }
 
-void ResetSelectedDisplay() {
-    if (g_selectedDisplay < 0 ||
-        g_selectedDisplay >= static_cast<int>(g_displays.size())) {
-        return;
-    }
-    CancelPendingSliderApply();
-    g_updatingControls = true;
-    SendMessageW(g_gammaSlider, TBM_SETPOS, TRUE, 100);
-    SetWindowTextW(g_gammaValue, L"1.00");
-    g_updatingControls = false;
-    ApplySliderValue();
-}
-
-void ToggleMaximumGamma() {
+void ToggleGamma() {
     CancelPendingSliderApply();
     if (g_selectedDisplay < 0 ||
         g_selectedDisplay >= static_cast<int>(g_displays.size())) {
-        SetStatus(L"No display is selected for the gamma hotkey.", true);
+        ReportError(L"No display is selected for the gamma hotkey.");
         return;
     }
 
     DisplayState& display = g_displays[static_cast<std::size_t>(g_selectedDisplay)];
-    const bool restoreDefault =
-        display.enabled &&
-        std::abs(display.gamma - gamma_changer::kMaximumGamma) < 0.0001;
-    const double gamma = restoreDefault ? 1.0 : gamma_changer::kMaximumGamma;
+    const double current = display.enabled ? display.gamma : 1.0;
+    const double gamma = gamma_changer::NextToggleGamma(
+        current, g_toggleFirstGamma, g_toggleSecondGamma);
     std::wstring error;
-    ApplyGammaToDisplay(display, gamma, !restoreDefault, error);
+    ApplyGammaToDisplay(display, gamma, std::abs(gamma - 1.0) >= 0.0001, error);
     UpdateSelectedDisplayUi();
 }
 
@@ -1308,7 +1102,7 @@ void ResetAllDisplays() {
         }
     }
     if (!firstError.empty()) {
-        SetStatus(firstError, true);
+        ReportError(firstError);
     }
 }
 
@@ -1389,190 +1183,55 @@ HWND CreateControl(
         nullptr);
 }
 
+void SaveToggleValue(HWND control) {
+    double& saved = control == g_toggleFirst ? g_toggleFirstGamma : g_toggleSecondGamma;
+    wchar_t text[64]{};
+    GetWindowTextW(control, text, ARRAYSIZE(text));
+    double value = 0.0;
+    if (!gamma_changer::ParseToggleGamma(text, value)) {
+        ReportError(L"Enter a gamma value between 0.50 and 3.00.");
+    } else if (value != saved) {
+        auto key = OpenRegistryKey(kAppRegistryPath, KEY_SET_VALUE, true);
+        const DWORD milli = static_cast<DWORD>(std::lround(value * 1000.0));
+        if (!key || RegSetValueExW(key.value,
+                control == g_toggleFirst ? L"ToggleFirstGammaMilli" : L"ToggleSecondGammaMilli",
+                0, REG_DWORD, reinterpret_cast<const BYTE*>(&milli), sizeof(milli)) != ERROR_SUCCESS) {
+            ReportError(L"Could not save the hotkey gamma values.");
+        } else {
+            saved = value;
+        }
+    }
+    SetWindowTextW(control, FormatGamma(saved).c_str());
+}
+
 void CreateMainControls() {
-    g_header = CreateControl(L"STATIC", L"Gamma Changer", SS_LEFT | SS_NOPREFIX, kControlHeader);
-    g_subtitle = CreateControl(
-        L"STATIC",
-        L"Uses the GPU's 256-point RGB gamma ramp—the same SDR adjustment path as Windows Display Color Calibration.",
-        SS_LEFT | SS_NOPREFIX,
-        kControlSubtitle);
-    g_displayLabel = CreateControl(
-        L"STATIC", L"Display", SS_LEFT | SS_NOPREFIX, kControlDisplayLabel);
-    g_displayCombo = CreateControl(
-        WC_COMBOBOXW,
-        L"",
+    g_displayLabel = CreateControl(L"STATIC", L"Display", SS_NOPREFIX, kControlDisplayLabel);
+    g_displayCombo = CreateControl(WC_COMBOBOXW, L"",
         CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
-        kControlDisplayCombo,
-        WS_EX_CLIENTEDGE);
-    g_gammaLabel = CreateControl(
-        L"STATIC", L"Gamma correction", SS_LEFT | SS_NOPREFIX, kControlGammaLabel);
-    g_gammaValue = CreateControl(
-        L"STATIC", L"1.00", SS_RIGHT | SS_NOPREFIX, kControlGammaValue);
-    g_gammaSlider = CreateControl(
-        TRACKBAR_CLASSW,
-        L"",
-        TBS_HORZ | TBS_AUTOTICKS | TBS_DOWNISLEFT | WS_TABSTOP,
-        kControlGammaSlider);
+        kControlDisplayCombo, WS_EX_CLIENTEDGE);
+    g_gammaLabel = CreateControl(L"STATIC", L"Gamma", SS_NOPREFIX, kControlGammaLabel);
+    g_gammaValue = CreateControl(L"STATIC", L"1.00", SS_RIGHT, kControlGammaValue);
+    g_gammaSlider = CreateControl(TRACKBAR_CLASSW, L"",
+        TBS_HORZ | TBS_NOTICKS | TBS_DOWNISLEFT | WS_TABSTOP, kControlGammaSlider);
     SendMessageW(g_gammaSlider, TBM_SETRANGE, TRUE, MAKELPARAM(50, 300));
-    SendMessageW(g_gammaSlider, TBM_SETTICFREQ, 25, 0);
     SendMessageW(g_gammaSlider, TBM_SETPAGESIZE, 0, 10);
     SendMessageW(g_gammaSlider, TBM_SETLINESIZE, 0, 1);
     SendMessageW(g_gammaSlider, TBM_SETPOS, TRUE, 100);
-    g_minimumLabel = CreateControl(
-        L"STATIC", L"0.50 · darker midtones", SS_LEFT | SS_NOPREFIX, kControlMinimumLabel);
-    g_maximumLabel = CreateControl(
-        L"STATIC", L"3.00 · brighter midtones", SS_RIGHT | SS_NOPREFIX, kControlMaximumLabel);
-    g_pattern = CreateControl(kPatternClassName, L"", 0U, kControlPattern);
-    g_hint = CreateControl(
-        L"STATIC",
-        L"Move the slider until the middle dots are only faintly visible. Changes are live and saved for the selected display.",
-        SS_LEFT | SS_NOPREFIX,
-        kControlHint);
-    g_hotkeyLabel = CreateControl(
-        L"STATIC",
-        L"Single-key toggle: 3.00 ↔ 1.00",
-        SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
-        kControlHotkeyLabel);
-    g_hotkeyControl = CreateControl(
-        L"EDIT",
-        L"Not set",
+    g_hotkeyLabel = CreateControl(L"STATIC", L"Hotkey", SS_CENTERIMAGE, kControlHotkeyLabel);
+    g_hotkeyControl = CreateControl(L"EDIT", L"Not set",
         ES_READONLY | ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP,
-        kControlHotkey,
-        WS_EX_CLIENTEDGE);
+        kControlHotkey, WS_EX_CLIENTEDGE);
     SetWindowSubclass(g_hotkeyControl, SingleKeyControlProc, 1U, 0U);
-    g_saveHotkey = CreateControl(
-        L"BUTTON", L"Set key", BS_PUSHBUTTON | WS_TABSTOP, kControlSaveHotkey);
-    g_clearHotkey = CreateControl(
-        L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, kControlClearHotkey);
-    g_startup = CreateControl(
-        L"BUTTON",
-        L"Start with Windows and reapply after display changes",
-        BS_AUTOCHECKBOX | WS_TABSTOP,
-        kControlStartup);
-    SendMessageW(g_startup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
-    g_reset = CreateControl(
-        L"BUTTON", L"Reset this display", BS_PUSHBUTTON | WS_TABSTOP, kControlReset);
-    g_status = CreateControl(
-        L"STATIC", L"Starting…", SS_LEFT | SS_NOPREFIX, kControlStatus);
-
+    g_clearHotkey = CreateControl(L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, kControlClearHotkey);
+    g_toggleLabel = CreateControl(L"STATIC", L"Toggle values", SS_CENTERIMAGE, kControlToggleLabel);
+    g_toggleFirst = CreateControl(L"EDIT", FormatGamma(g_toggleFirstGamma).c_str(),
+        ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, kControlToggleFirst, WS_EX_CLIENTEDGE);
+    g_toggleSecond = CreateControl(L"EDIT", FormatGamma(g_toggleSecondGamma).c_str(),
+        ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, kControlToggleSecond, WS_EX_CLIENTEDGE);
+    SendMessageW(g_toggleFirst, EM_SETLIMITTEXT, 16, 0);
+    SendMessageW(g_toggleSecond, EM_SETLIMITTEXT, 16, 0);
     RecreateFonts();
     LayoutControls();
-}
-
-void PaintCalibrationPattern(const HWND window) {
-    PAINTSTRUCT paint{};
-    HDC destination = BeginPaint(window, &paint);
-    RECT client{};
-    GetClientRect(window, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-
-    HDC buffer = CreateCompatibleDC(destination);
-    HBITMAP bitmap = CreateCompatibleBitmap(destination, std::max(1, width), std::max(1, height));
-    HGDIOBJ oldBitmap = SelectObject(buffer, bitmap);
-
-    FillRect(buffer, &client, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
-    const auto colorBrush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(214, 220, 228));
-    HGDIOBJ oldPen = SelectObject(buffer, borderPen);
-    HGDIOBJ oldBrush = SelectObject(buffer, GetStockObject(NULL_BRUSH));
-    RoundRect(buffer, 0, 0, std::max(1, width), std::max(1, height), 12, 12);
-
-    SetBkMode(buffer, TRANSPARENT);
-    SetTextColor(buffer, RGB(64, 72, 86));
-    HGDIOBJ oldFont = SelectObject(buffer, g_smallFont != nullptr ? g_smallFont : GetStockObject(DEFAULT_GUI_FONT));
-    RECT titleRect{16, 9, width - 16, 30};
-    DrawTextW(buffer, L"Visual calibration target", -1, &titleRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    const int availableHeight = std::max(50, height - 52);
-    const int radius = std::clamp(availableHeight / 3, 19, 35);
-    const int centerY = 35 + radius;
-    const std::array<int, 3> centerGray = {116, 128, 140};
-    const std::array<const wchar_t*, 3> captions = {L"visible", L"faint", L"visible"};
-
-    for (int target = 0; target < 3; ++target) {
-        const int centerX = width * (target + 1) / 4;
-        HRGN circle = CreateEllipticRgn(
-            centerX - radius,
-            centerY - radius,
-            centerX + radius + 1,
-            centerY + radius + 1);
-        const int savedDc = SaveDC(buffer);
-        SelectClipRgn(buffer, circle);
-        for (int x = centerX - radius; x <= centerX + radius; x += 2) {
-            RECT stripe{x, centerY - radius, x + 2, centerY + radius + 1};
-            SetDCBrushColor(
-                buffer,
-                ((x - centerX + radius) / 2) % 2 == 0
-                    ? RGB(72, 72, 72)
-                    : RGB(184, 184, 184));
-            FillRect(buffer, &stripe, colorBrush);
-        }
-        RestoreDC(buffer, savedDc);
-        DeleteObject(circle);
-
-        SelectObject(buffer, borderPen);
-        SelectObject(buffer, GetStockObject(NULL_BRUSH));
-        Ellipse(
-            buffer,
-            centerX - radius,
-            centerY - radius,
-            centerX + radius + 1,
-            centerY + radius + 1);
-
-        const int dotRadius = std::max(7, radius / 3);
-        SetDCBrushColor(buffer, RGB(
-            centerGray[static_cast<std::size_t>(target)],
-            centerGray[static_cast<std::size_t>(target)],
-            centerGray[static_cast<std::size_t>(target)]));
-        SelectObject(buffer, colorBrush);
-        Ellipse(
-            buffer,
-            centerX - dotRadius,
-            centerY - dotRadius,
-            centerX + dotRadius + 1,
-            centerY + dotRadius + 1);
-        SelectObject(buffer, GetStockObject(NULL_BRUSH));
-
-        RECT captionRect{
-            centerX - radius - 12,
-            centerY + radius + 2,
-            centerX + radius + 12,
-            height - 5};
-        DrawTextW(
-            buffer,
-            captions[static_cast<std::size_t>(target)],
-            -1,
-            &captionRect,
-            DT_CENTER | DT_SINGLELINE | DT_TOP);
-    }
-
-    SelectObject(buffer, oldFont);
-    SelectObject(buffer, oldBrush);
-    SelectObject(buffer, oldPen);
-    DeleteObject(borderPen);
-    BitBlt(destination, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
-    SelectObject(buffer, oldBitmap);
-    DeleteObject(bitmap);
-    DeleteDC(buffer);
-    EndPaint(window, &paint);
-}
-
-LRESULT CALLBACK PatternWindowProc(
-    const HWND window,
-    const UINT message,
-    const WPARAM wParam,
-    const LPARAM lParam) {
-    switch (message) {
-        case WM_PAINT:
-            PaintCalibrationPattern(window);
-            return 0;
-        case WM_ERASEBKGND:
-            return 1;
-        default:
-            return DefWindowProcW(window, message, wParam, lParam);
-    }
 }
 
 LRESULT CALLBACK MainWindowProc(
@@ -1598,7 +1257,7 @@ LRESULT CALLBACK MainWindowProc(
             UpdateSelectedDisplayUi();
             std::wstring hotkeyError;
             if (!InstallLoadedSingleKey(hotkeyError)) {
-                SetStatus(hotkeyError, true);
+                ReportError(hotkeyError);
             }
             return 0;
         }
@@ -1625,8 +1284,8 @@ LRESULT CALLBACK MainWindowProc(
 
         case WM_GETMINMAXINFO: {
             auto* minMax = reinterpret_cast<MINMAXINFO*>(lParam);
-            minMax->ptMinTrackSize.x = ScaleForDpi(window, 620);
-            minMax->ptMinTrackSize.y = ScaleForDpi(window, 660);
+            minMax->ptMinTrackSize.x = ScaleForDpi(window, 400);
+            minMax->ptMinTrackSize.y = ScaleForDpi(window, 310);
             return 0;
         }
 
@@ -1636,29 +1295,14 @@ LRESULT CALLBACK MainWindowProc(
             RECT client{};
             GetClientRect(window, &client);
             FillRect(dc, &client, g_backgroundBrush);
-            HPEN separator = CreatePen(PS_SOLID, 1, RGB(220, 225, 232));
-            HGDIOBJ oldPen = SelectObject(dc, separator);
-            const int y = ScaleForDpi(window, 109);
-            MoveToEx(dc, ScaleForDpi(window, 32), y, nullptr);
-            LineTo(dc, client.right - ScaleForDpi(window, 32), y);
-            SelectObject(dc, oldPen);
-            DeleteObject(separator);
             EndPaint(window, &paint);
             return 0;
         }
 
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wParam);
-            HWND control = reinterpret_cast<HWND>(lParam);
             SetBkMode(dc, TRANSPARENT);
-            if (control == g_status) {
-                SetTextColor(dc, g_statusIsError ? RGB(180, 42, 42) : RGB(32, 116, 76));
-            } else if (control == g_subtitle || control == g_hint ||
-                       control == g_minimumLabel || control == g_maximumLabel) {
-                SetTextColor(dc, RGB(92, 101, 116));
-            } else {
-                SetTextColor(dc, RGB(28, 33, 41));
-            }
+            SetTextColor(dc, RGB(28, 33, 41));
             return reinterpret_cast<LRESULT>(g_backgroundBrush);
         }
 
@@ -1729,36 +1373,13 @@ LRESULT CALLBACK MainWindowProc(
                 }
                 return 0;
             }
-            if (identifier == kControlReset && notification == BN_CLICKED) {
-                ResetSelectedDisplay();
-                return 0;
-            }
-            if (identifier == kControlSaveHotkey && notification == BN_CLICKED) {
-                SaveHotkeyFromControl();
-                return 0;
-            }
             if (identifier == kControlClearHotkey && notification == BN_CLICKED) {
                 ClearSavedHotkey();
                 return 0;
             }
-            if (identifier == kControlStartup && notification == BN_CLICKED) {
-                const bool requested =
-                    SendMessageW(g_startup, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                std::wstring error;
-                if (!SetStartupEnabled(requested, error)) {
-                    SendMessageW(
-                        g_startup,
-                        BM_SETCHECK,
-                        requested ? BST_UNCHECKED : BST_CHECKED,
-                        0);
-                    SetStatus(error, true);
-                } else {
-                    SetStatus(
-                        requested
-                            ? L"Startup enabled · Gamma Changer will run in the notification area"
-                            : L"Startup disabled",
-                        false);
-                }
+            if ((identifier == kControlToggleFirst || identifier == kControlToggleSecond) &&
+                notification == EN_KILLFOCUS) {
+                SaveToggleValue(reinterpret_cast<HWND>(lParam));
                 return 0;
             }
             if (identifier == kMenuOpen) {
@@ -1800,17 +1421,14 @@ LRESULT CALLBACK MainWindowProc(
             return 0;
 
         case kSingleKeyMessage:
-            ToggleMaximumGamma();
+            if (GetFocus() == g_toggleFirst || GetFocus() == g_toggleSecond) {
+                SaveToggleValue(GetFocus());
+            }
+            ToggleGamma();
             return 0;
 
         case kKeyCapturedMessage:
-            SetHotkeyControlValue(g_pendingHotkeyVirtualKey);
-            if (GetForegroundWindow() == window && GetFocus() == g_hotkeyControl) {
-                SetStatus(
-                    L"Selected " + gamma_changer::SingleKeyName(g_pendingHotkeyVirtualKey) +
-                        L" · Click Set key to save",
-                    false);
-            }
+            SaveHotkeyFromControl();
             return 0;
 
         case kTrayMessage:
@@ -1826,6 +1444,8 @@ LRESULT CALLBACK MainWindowProc(
             return 0;
 
         case WM_CLOSE:
+            SaveToggleValue(g_toggleFirst);
+            SaveToggleValue(g_toggleSecond);
             FlushPendingSliderApply();
             DestroyWindow(window);
             return 0;
@@ -1846,18 +1466,6 @@ LRESULT CALLBACK MainWindowProc(
 }
 
 bool RegisterWindowClasses(const HICON icon, const HICON smallIcon) {
-    WNDCLASSEXW patternClass{};
-    patternClass.cbSize = sizeof(patternClass);
-    patternClass.style = CS_HREDRAW | CS_VREDRAW;
-    patternClass.lpfnWndProc = PatternWindowProc;
-    patternClass.hInstance = g_instance;
-    patternClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    patternClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    patternClass.lpszClassName = kPatternClassName;
-    if (RegisterClassExW(&patternClass) == 0U) {
-        return false;
-    }
-
     WNDCLASSEXW mainClass{};
     mainClass.cbSize = sizeof(mainClass);
     mainClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -1930,8 +1538,8 @@ int APIENTRY wWinMain(
         return 1;
     }
 
-    const int width = ScaleForDpi(nullptr, 730);
-    const int height = ScaleForDpi(nullptr, 700);
+    const int width = ScaleForDpi(nullptr, 460);
+    const int height = ScaleForDpi(nullptr, 310);
     HWND window = CreateWindowExW(
         WS_EX_CONTROLPARENT,
         kWindowClassName,
@@ -1958,23 +1566,22 @@ int APIENTRY wWinMain(
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN &&
+            (GetFocus() == g_toggleFirst || GetFocus() == g_toggleSecond)) {
+            SetFocus(g_gammaSlider);
+            continue;
+        }
         if (!IsDialogMessageW(window, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
 
-    if (g_headerFont != nullptr) {
-        DeleteObject(g_headerFont);
-    }
     if (g_valueFont != nullptr) {
         DeleteObject(g_valueFont);
     }
     if (g_bodyFont != nullptr) {
         DeleteObject(g_bodyFont);
-    }
-    if (g_smallFont != nullptr) {
-        DeleteObject(g_smallFont);
     }
     DeleteObject(g_backgroundBrush);
     CloseHandle(instanceMutex);

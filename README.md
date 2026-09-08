@@ -12,11 +12,9 @@ calibration instead of replacing it with a generic identity ramp.
 ## Features
 
 - Live gamma adjustment from `0.50` to `3.00`
-- Configurable dedicated key, including Right Shift, that toggles the selected display between `3.00` and `1.00`, regardless of held modifiers
+- Configurable dedicated key, including Right Shift, that toggles the selected display between two saved gamma values, regardless of held modifiers
 - Separate saved setting for each active Windows display device
 - Read-back verification to detect drivers that silently ignore gamma changes
-- One-click restoration of the captured Windows calibration
-- Optional current-user Startup entry; no administrator rights required
 - Notification-area mode that reapplies settings after display changes, resume, and unlock
 - Per-monitor-DPI-aware native Win32 interface
 
@@ -48,10 +46,11 @@ matching SHA-256 checksum is provided with each release.
 
 1. Select a display.
 2. Move the slider. The hardware ramp changes after a short debounce so dragging stays responsive.
-3. Click the key box beside **Single-key toggle**, press one key (for example **Right Shift**), then select **Set key**. Left and right modifier keys are separate choices. The recorder accepts only the first key pressed; key combinations are not supported. Click the box again to record a different key.
-4. Press that key once for maximum gamma (`3.00`) and again to restore the captured Windows baseline (`1.00`). It works even while Shift, Ctrl, or Alt is held. The chosen key is dedicated to Gamma Changer and its normal action is suppressed while the app runs.
-5. Use **Reset this display** to restore the ramp that Windows had before Gamma Changer changed it.
-6. Enable **Start with Windows** if the correction should survive sign-in and display resets.
+3. Click the **Hotkey** box and press one key (for example **Right Shift**). It saves immediately. Left and right modifier keys are separate choices; key combinations are not supported. Use **Clear** to disable the hotkey.
+4. Enter your two **Toggle values** (`0.50`–`3.00`, in steps of `0.01`). Press Enter, Tab, or click elsewhere to save each value. These values are shared across displays and remembered after restarting.
+5. Press the hotkey to switch the selected display between those values. From another slider value, the first press selects the second value. The key works even while Shift, Ctrl, or Alt is held; its normal action is suppressed while the app runs.
+
+Set gamma to `1.00` to restore the captured Windows calibration. Gamma or settings errors appear as notification-area alerts.
 
 The title-bar **X closes Gamma Changer completely** while leaving the current ramp in
 place. Its notification-area menu can also exit, or reset every display and exit.
@@ -76,7 +75,7 @@ requested here.
 
 ## Tests
 
-Run both the ramp-math and single-key regression tests with CMake on Windows or Linux:
+Run the ramp-math, configurable-toggle, and single-key regression tests with CMake on Windows or Linux:
 
 ```bash
 cmake -S . -B build-local/tests -DBUILD_TESTING=ON

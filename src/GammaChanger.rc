@@ -7,8 +7,8 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 IDI_GAMMA_CHANGER ICON "assets/flashbang.ico"
 
 1 VERSIONINFO
- FILEVERSION 1,2,3,0
- PRODUCTVERSION 1,2,3,0
+ FILEVERSION 1,3,0,0
+ PRODUCTVERSION 1,3,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -25,11 +25,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Gamma Changer\0"
             VALUE "FileDescription", "Windows hardware gamma-ramp utility\0"
-            VALUE "FileVersion", "1.2.3\0"
+            VALUE "FileVersion", "1.3.0\0"
             VALUE "InternalName", "GammaChanger\0"
             VALUE "OriginalFilename", "GammaChanger.exe\0"
             VALUE "ProductName", "Gamma Changer\0"
-            VALUE "ProductVersion", "1.2.3\0"
+            VALUE "ProductVersion", "1.3.0\0"
         END
     END
     BLOCK "VarFileInfo"

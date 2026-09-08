@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     GammaChanger
-    VERSION 1.2.3
+    VERSION 1.3.0
     DESCRIPTION "Native Windows hardware gamma-ramp utility"
     LANGUAGES CXX)
 
@@ -28,6 +28,7 @@ if(WIN32)
     enable_language(RC)
     add_executable(GammaChanger WIN32
         src/main.cpp
+        src/gamma_toggle.h
         src/resource.h
         src/single_key.h
         src/single_key_win32.h
@@ -69,6 +70,15 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(gamma_toggle_tests tests/gamma_toggle_tests.cpp)
+    target_link_libraries(gamma_toggle_tests PRIVATE gamma_math)
+    if(MSVC)
+        target_compile_options(gamma_toggle_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(gamma_toggle_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME gamma_toggle_tests COMMAND gamma_toggle_tests)
+
     add_executable(gamma_math_tests tests/gamma_math_tests.cpp)
     target_link_libraries(gamma_math_tests PRIVATE gamma_math)
     if(MSVC)
