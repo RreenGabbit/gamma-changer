@@ -46,11 +46,13 @@ constexpr UINT kTrayMessage = WM_APP + 1U;
 constexpr UINT kShowWindowMessage = WM_APP + 2U;
 constexpr UINT kSingleKeyMessage = WM_APP + 3U;
 constexpr UINT kKeyCapturedMessage = WM_APP + 4U;
+constexpr UINT kMapKeyStateMessage = WM_APP + 5U;
 constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 constexpr UINT_PTR kAutoGammaTimerId = 3U;
 constexpr UINT kAutoGammaIntervalMilliseconds = 500U;
 constexpr wchar_t kRustClientExecutable[] = L"RustClient.exe";
+constexpr UINT kRustMapVirtualKey = 'G';
 
 constexpr int kControlDisplayLabel = 1003;
 constexpr int kControlDisplayCombo = 1004;
@@ -187,6 +189,7 @@ UINT g_pendingHotkeyVirtualKey = 0U;
 HHOOK g_keyboardHook = nullptr;
 bool g_sliderApplyPending = false;
 bool g_autoRustEnabled = false;
+bool g_rustMapKeyHeld = false;
 bool g_hasSavedAutoState = false;
 SavedAutoControlState g_savedAutoState;
 gamma_changer::AutoGammaDetector g_autoGammaDetector;
@@ -692,6 +695,11 @@ LRESULT CALLBACK SingleKeyKeyboardProc(
         const bool isKeyDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         const bool isKeyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
         if (isKeyDown || isKeyUp) {
+            if (keyboard->vkCode == kRustMapVirtualKey &&
+                g_rustMapKeyHeld != isKeyDown) {
+                g_rustMapKeyHeld = isKeyDown;
+                PostMessageW(g_mainWindow, kMapKeyStateMessage, 0, 0);
+            }
             const bool keyBoxFocused = GetForegroundWindow() == g_mainWindow &&
                                        GetFocus() == g_hotkeyControl;
             if (!keyBoxFocused) {
@@ -719,6 +727,7 @@ void RemoveSingleKeyHook() {
         g_keyboardHook = nullptr;
     }
     g_singleKeyInput.CancelCapture();
+    g_rustMapKeyHeld = false;
 }
 
 bool InstallSingleKeyHook(std::wstring& errorMessage) {
@@ -1323,9 +1332,9 @@ void UpdateAutomaticGamma() {
     }
 
     const HWND rustWindow = RustForegroundWindow();
-    double luminance = 0.0;
-    if (rustWindow == nullptr || !SampleWindowLuminance(rustWindow, luminance)) {
+    if (rustWindow == nullptr) {
         g_autoGammaDetector.Reset();
+        g_rustMapKeyHeld = false;
         RestoreAutoControlledDisplay();
         return;
     }
@@ -1358,9 +1367,20 @@ void UpdateAutomaticGamma() {
 
     const double nightGamma =
         std::max(1.0, std::max(g_toggleFirstGamma, g_toggleSecondGamma));
-    const bool night = g_autoGammaDetector.Update(luminance);
-    const double target =
-        gamma_changer::AutomaticGammaTarget(night, nightGamma);
+    g_rustMapKeyHeld =
+        (GetAsyncKeyState(static_cast<int>(kRustMapVirtualKey)) & 0x8000) != 0;
+
+    double target = 1.0;
+    if (!g_rustMapKeyHeld) {
+        double luminance = 0.0;
+        if (!SampleWindowLuminance(rustWindow, luminance)) {
+            g_autoGammaDetector.Reset();
+            RestoreAutoControlledDisplay();
+            return;
+        }
+        const bool night = g_autoGammaDetector.Update(luminance);
+        target = gamma_changer::AutomaticGammaTarget(night, nightGamma);
+    }
     const double current = display.enabled ? display.gamma : 1.0;
     if (std::abs(target - current) < 0.005) {
         return;
@@ -1404,6 +1424,9 @@ void SetAutoRustEnabled(const bool enabled, const bool restoreManualGamma) {
 
     g_autoRustEnabled = enabled;
     g_autoGammaDetector.Reset();
+    if (!enabled) {
+        g_rustMapKeyHeld = false;
+    }
     std::wstring error;
     if (!SaveAutoRustSetting(enabled, error)) {
         ReportError(error);
@@ -1857,6 +1880,12 @@ LRESULT CALLBACK MainWindowProc(
 
         case kKeyCapturedMessage:
             SaveHotkeyFromControl();
+            return 0;
+
+        case kMapKeyStateMessage:
+            if (g_autoRustEnabled) {
+                UpdateAutomaticGamma();
+            }
             return 0;
 
         case kTrayMessage:

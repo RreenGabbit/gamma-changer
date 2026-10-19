@@ -52,6 +52,8 @@ matching SHA-256 checksum is provided with each release.
 5. Press the hotkey to switch the selected display between those values. From another slider value, the first press selects the second value. The key works even while Shift, Ctrl, or Alt is held; its normal action is suppressed while the app runs.
 6. Tick **Auto-brighten Rust when the game gets dark** to enable the automatic mode. It checks the center of the foreground Rust window twice per second and switches between `1.00` in daylight and the brighter of your two toggle values at night. It measures median scene brightness, smooths several samples, and requires the scene to stay dark or bright before switching, so flashes, HUD elements, and brief lights do not cause rapid changes. When Rust is not in front, your previous manual gamma is restored.
 
+Holding the default Rust map key (`G`) temporarily returns gamma to `1.00`; releasing it immediately restores the night value. Change the map binding in Rust or request a configurable map key if you do not use `G`.
+
 Set gamma to `1.00` to restore the captured Windows calibration. Gamma or settings errors appear as notification-area alerts.
 
 For a moderate automatic result, use toggle values such as `1.00` and `2.20`. The factory default second value is `3.00`, which is the brightest possible night endpoint. Moving the gamma slider or pressing the gamma hotkey while auto mode is active turns auto mode off so manual input is not overwritten.
