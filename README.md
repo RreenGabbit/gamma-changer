@@ -13,6 +13,7 @@ calibration instead of replacing it with a generic identity ramp.
 
 - Live gamma adjustment from `0.50` to `3.00`
 - Configurable dedicated key, including Right Shift, that toggles the selected display between two saved gamma values, regardless of held modifiers
+- Optional Rust auto mode that samples median game brightness and switches between neutral and the configured night gamma
 - Separate saved setting for each active Windows display device
 - Read-back verification to detect drivers that silently ignore gamma changes
 - Notification-area mode that reapplies settings after display changes, resume, and unlock
@@ -49,11 +50,14 @@ matching SHA-256 checksum is provided with each release.
 3. Click the **Hotkey** box and press one key (for example **Right Shift**). It saves immediately. Left and right modifier keys are separate choices; key combinations are not supported. Use **Clear** to disable the hotkey.
 4. Enter your two **Toggle values** (`0.50`–`3.00`, in steps of `0.01`). Press Enter, Tab, or click elsewhere to save each value. These values are shared across displays and remembered after restarting.
 5. Press the hotkey to switch the selected display between those values. From another slider value, the first press selects the second value. The key works even while Shift, Ctrl, or Alt is held; its normal action is suppressed while the app runs.
+6. Tick **Auto-brighten Rust when the game gets dark** to enable the automatic mode. It checks the center of the foreground Rust window twice per second and switches between `1.00` in daylight and the brighter of your two toggle values at night. It measures median scene brightness, smooths several samples, and requires the scene to stay dark or bright before switching, so flashes, HUD elements, and brief lights do not cause rapid changes. When Rust is not in front, your previous manual gamma is restored.
 
 Set gamma to `1.00` to restore the captured Windows calibration. Gamma or settings errors appear as notification-area alerts.
 
-The title-bar **X closes Gamma Changer completely** while leaving the current ramp in
-place. Its notification-area menu can also exit, or reset every display and exit.
+For a moderate automatic result, use toggle values such as `1.00` and `2.20`. The factory default second value is `3.00`, which is the brightest possible night endpoint. Moving the gamma slider or pressing the gamma hotkey while auto mode is active turns auto mode off so manual input is not overwritten.
+
+The title-bar **X closes Gamma Changer completely** and resets every display to `1.00`.
+The notification-area menu uses the same reset-and-exit behavior.
 
 ## Important Windows limitations
 
@@ -63,6 +67,9 @@ but the operating system and display driver control the final hardware state:
 - Turn **HDR off** for the selected display. Microsoft documents GDI gamma-ramp behavior as undefined in HDR mode.
 - A GPU driver can expose one shared ramp for multiple outputs, even when Windows lists separate monitors.
 - Windows, a game, another calibration loader, or a graphics driver can overwrite the ramp. Keeping Gamma Changer running lets it reapply after common reset events.
+- Rust auto mode relies on foreground-window screen sampling. It works best in borderless or windowed mode; exclusive fullscreen or capture-protected surfaces can prevent Windows from returning readable pixels, in which case the app leaves gamma unchanged.
+- Rust auto mode detects the rendered scene instead of a server clock, so it works with custom server day/night lengths. Bright UI or a dark indoor scene can affect the measured brightness.
+- Facepunch has described gamma boosting in Rust as an unfair advantage and works with Easy Anti-Cheat on detection. No third-party gamma utility can guarantee account safety; use automatic mode only on servers where it is permitted.
 - Some drivers report success but ignore the request. Gamma Changer reads the ramp back and reports that case.
 - Full colorimetric calibration (measured primaries, white point, HDR, and persistent ICC/MHC profiles) is broader than a gamma adjustment. Use Windows Display Color Calibration or a hardware colorimeter for that job.
 
@@ -75,7 +82,7 @@ requested here.
 
 ## Tests
 
-Run the ramp-math, configurable-toggle, and single-key regression tests with CMake on Windows or Linux:
+Run the ramp-math, automatic-gamma, configurable-toggle, and single-key regression tests with CMake on Windows or Linux:
 
 ```bash
 cmake -S . -B build-local/tests -DBUILD_TESTING=ON
