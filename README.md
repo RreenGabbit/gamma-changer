@@ -50,9 +50,9 @@ matching SHA-256 checksum is provided with each release.
 3. Click the **Hotkey** box and press one key (for example **Right Shift**). It saves immediately. Left and right modifier keys are separate choices; key combinations are not supported. Use **Clear** to disable the hotkey.
 4. Enter your two **Toggle values** (`0.50`–`3.00`, in steps of `0.01`). Press Enter, Tab, or click elsewhere to save each value. These values are shared across displays and remembered after restarting.
 5. Press the hotkey to switch the selected display between those values. From another slider value, the first press selects the second value. The key works even while Shift, Ctrl, or Alt is held; its normal action is suppressed while the app runs.
-6. Tick **Auto-brighten Rust when the game gets dark** to enable the automatic mode. It checks the center of the foreground Rust window twice per second and switches between `1.00` in daylight and the brighter of your two toggle values at night. It measures median scene brightness, smooths several samples, and requires the scene to stay dark or bright before switching, so flashes, HUD elements, and brief lights do not cause rapid changes. When Rust is not in front, your previous manual gamma is restored.
+6. Tick **Auto-brighten Rust when the game gets dark** to enable the automatic mode. It checks the center of the foreground Rust window twice per second and switches between `1.00` in daylight and the brighter of your two toggle values at night. It measures median scene brightness, smooths several samples, and requires the scene to stay dark or bright before switching, so flashes, HUD elements, and brief lights do not cause rapid changes. When Rust is not in front, gamma returns to `1.00`.
 
-Holding the default Rust map key (`G`) temporarily returns gamma to `1.00`; releasing it immediately restores the night value. Change the map binding in Rust or request a configurable map key if you do not use `G`.
+Holding the default Rust map key (`G`) temporarily returns gamma to `1.00`; releasing it waits 0.1 seconds before restoring the night value to match the map fade. Change the map binding in Rust or request a configurable map key if you do not use `G`.
 
 Set gamma to `1.00` to restore the captured Windows calibration. Gamma or settings errors appear as notification-area alerts.
 

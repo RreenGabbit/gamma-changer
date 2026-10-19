@@ -50,7 +50,9 @@ constexpr UINT kMapKeyStateMessage = WM_APP + 5U;
 constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 constexpr UINT_PTR kAutoGammaTimerId = 3U;
+constexpr UINT_PTR kMapReleaseDelayTimerId = 4U;
 constexpr UINT kAutoGammaIntervalMilliseconds = 500U;
+constexpr UINT kMapReleaseDelayMilliseconds = 100U;
 constexpr wchar_t kRustClientExecutable[] = L"RustClient.exe";
 constexpr UINT kRustMapVirtualKey = 'G';
 
@@ -698,7 +700,11 @@ LRESULT CALLBACK SingleKeyKeyboardProc(
             if (keyboard->vkCode == kRustMapVirtualKey &&
                 g_rustMapKeyHeld != isKeyDown) {
                 g_rustMapKeyHeld = isKeyDown;
-                PostMessageW(g_mainWindow, kMapKeyStateMessage, 0, 0);
+                PostMessageW(
+                    g_mainWindow,
+                    kMapKeyStateMessage,
+                    isKeyDown ? 1U : 0U,
+                    0);
             }
             const bool keyBoxFocused = GetForegroundWindow() == g_mainWindow &&
                                        GetFocus() == g_hotkeyControl;
@@ -1326,6 +1332,27 @@ void RestoreAutoControlledDisplay() {
     }
 }
 
+void NeutralizeAutoControlledDisplay() {
+    if (!g_hasSavedAutoState) {
+        return;
+    }
+    const int index = FindDisplayIndex(g_savedAutoState.deviceName);
+    if (index < 0) {
+        return;
+    }
+    DisplayState& display = g_displays[static_cast<std::size_t>(index)];
+    if (!display.enabled && std::abs(display.gamma - 1.0) < 0.0001) {
+        return;
+    }
+    std::wstring error;
+    if (!ApplyGammaToDisplay(display, 1.0, false, error, false)) {
+        ReportError(L"Could not return gamma to neutral outside Rust: " + error);
+    }
+    if (index == g_selectedDisplay) {
+        UpdateSelectedDisplayUi();
+    }
+}
+
 void UpdateAutomaticGamma() {
     if (!g_autoRustEnabled) {
         return;
@@ -1335,7 +1362,7 @@ void UpdateAutomaticGamma() {
     if (rustWindow == nullptr) {
         g_autoGammaDetector.Reset();
         g_rustMapKeyHeld = false;
-        RestoreAutoControlledDisplay();
+        NeutralizeAutoControlledDisplay();
         return;
     }
 
@@ -1357,7 +1384,8 @@ void UpdateAutomaticGamma() {
         _wcsicmp(
             g_savedAutoState.deviceName.c_str(),
             display.deviceName.c_str()) != 0) {
-        RestoreAutoControlledDisplay();
+        NeutralizeAutoControlledDisplay();
+        DiscardSavedAutoState();
         g_savedAutoState.deviceName = display.deviceName;
         g_savedAutoState.gamma = display.gamma;
         g_savedAutoState.enabled = display.enabled;
@@ -1375,7 +1403,7 @@ void UpdateAutomaticGamma() {
         double luminance = 0.0;
         if (!SampleWindowLuminance(rustWindow, luminance)) {
             g_autoGammaDetector.Reset();
-            RestoreAutoControlledDisplay();
+            NeutralizeAutoControlledDisplay();
             return;
         }
         const bool night = g_autoGammaDetector.Update(luminance);
@@ -1447,6 +1475,7 @@ void SetAutoRustEnabled(const bool enabled, const bool restoreManualGamma) {
         }
     } else {
         KillTimer(g_mainWindow, kAutoGammaTimerId);
+        KillTimer(g_mainWindow, kMapReleaseDelayTimerId);
         if (restoreManualGamma) {
             RestoreAutoControlledDisplay();
         } else {
@@ -1519,6 +1548,7 @@ void ToggleGamma() {
 void ResetAllDisplays() {
     CancelPendingSliderApply();
     KillTimer(g_mainWindow, kAutoGammaTimerId);
+    KillTimer(g_mainWindow, kMapReleaseDelayTimerId);
     DiscardSavedAutoState();
     for (auto& display : g_displays) {
         display.autoControlled = false;
@@ -1797,6 +1827,11 @@ LRESULT CALLBACK MainWindowProc(
                 UpdateAutomaticGamma();
                 return 0;
             }
+            if (wParam == kMapReleaseDelayTimerId) {
+                KillTimer(window, kMapReleaseDelayTimerId);
+                UpdateAutomaticGamma();
+                return 0;
+            }
             break;
 
         case WM_COMMAND: {
@@ -1884,7 +1919,18 @@ LRESULT CALLBACK MainWindowProc(
 
         case kMapKeyStateMessage:
             if (g_autoRustEnabled) {
-                UpdateAutomaticGamma();
+                KillTimer(window, kMapReleaseDelayTimerId);
+                if (wParam == 0U) {
+                    if (SetTimer(
+                            window,
+                            kMapReleaseDelayTimerId,
+                            kMapReleaseDelayMilliseconds,
+                            nullptr) == 0U) {
+                        UpdateAutomaticGamma();
+                    }
+                } else {
+                    UpdateAutomaticGamma();
+                }
             }
             return 0;
 
@@ -1912,6 +1958,7 @@ LRESULT CALLBACK MainWindowProc(
             CancelPendingSliderApply();
             KillTimer(window, kDisplayRefreshTimerId);
             KillTimer(window, kAutoGammaTimerId);
+            KillTimer(window, kMapReleaseDelayTimerId);
             WTSUnRegisterSessionNotification(window);
             RemoveSingleKeyHook();
             RemoveTrayIcon();

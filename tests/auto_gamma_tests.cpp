@@ -66,7 +66,6 @@ int main() {
     Require(
         AutomaticGammaTarget(true, 0.8) == 1.0,
         "automatic mode never darkens below neutral");
-
     const double nan = std::numeric_limits<double>::quiet_NaN();
     Require(
         !detector.Update(nan),
