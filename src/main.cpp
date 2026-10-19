@@ -18,6 +18,7 @@
 #include <cwctype>
 #include <locale>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -103,6 +104,73 @@ struct ScopedIcon {
     }
 };
 
+struct ScopedHandle {
+    HANDLE value = nullptr;
+
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE handle) : value(handle) {}
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ~ScopedHandle() {
+        if (value != nullptr) {
+            CloseHandle(value);
+        }
+    }
+
+    explicit operator bool() const noexcept { return value != nullptr; }
+};
+
+struct ScopedDc {
+    HDC value = nullptr;
+    bool releaseDc = false;
+
+    ScopedDc(HDC dc, const bool release) : value(dc), releaseDc(release) {}
+    ScopedDc(const ScopedDc&) = delete;
+    ScopedDc& operator=(const ScopedDc&) = delete;
+
+    ~ScopedDc() {
+        if (value == nullptr) {
+            return;
+        }
+        if (releaseDc) {
+            ReleaseDC(nullptr, value);
+        } else {
+            DeleteDC(value);
+        }
+    }
+};
+
+struct ScopedGdiObject {
+    HGDIOBJ value = nullptr;
+
+    explicit ScopedGdiObject(HGDIOBJ object) : value(object) {}
+    ScopedGdiObject(const ScopedGdiObject&) = delete;
+    ScopedGdiObject& operator=(const ScopedGdiObject&) = delete;
+
+    ~ScopedGdiObject() {
+        if (value != nullptr) {
+            DeleteObject(value);
+        }
+    }
+};
+
+struct ScopedSelectedObject {
+    HDC dc = nullptr;
+    HGDIOBJ previous = nullptr;
+
+    ScopedSelectedObject(HDC deviceContext, HGDIOBJ object)
+        : dc(deviceContext), previous(SelectObject(deviceContext, object)) {}
+    ScopedSelectedObject(const ScopedSelectedObject&) = delete;
+    ScopedSelectedObject& operator=(const ScopedSelectedObject&) = delete;
+
+    ~ScopedSelectedObject() {
+        if (previous != nullptr && previous != HGDI_ERROR) {
+            SelectObject(dc, previous);
+        }
+    }
+};
+
 struct ScopedRegistryKey {
     HKEY value = nullptr;
 
@@ -175,7 +243,7 @@ HWND g_clearHotkey = nullptr;
 HWND g_toggleLabel = nullptr;
 HWND g_toggleFirst = nullptr;
 HWND g_toggleSecond = nullptr;
-HWND g_autoRust = nullptr;
+HWND g_autoRustCheckbox = nullptr;
 double g_toggleFirstGamma = 1.0;
 double g_toggleSecondGamma = 3.0;
 HFONT g_valueFont = nullptr;
@@ -192,8 +260,7 @@ HHOOK g_keyboardHook = nullptr;
 bool g_sliderApplyPending = false;
 bool g_autoRustEnabled = false;
 bool g_rustMapKeyHeld = false;
-bool g_hasSavedAutoState = false;
-SavedAutoControlState g_savedAutoState;
+std::optional<SavedAutoControlState> g_savedAutoState;
 gamma_changer::AutoGammaDetector g_autoGammaDetector;
 
 std::wstring FormatSystemError(const DWORD error) {
@@ -229,6 +296,10 @@ std::wstring FormatGamma(const double gamma) {
     stream.imbue(std::locale::classic());
     stream << std::fixed << std::setprecision(2) << gamma;
     return stream.str();
+}
+
+bool IsNeutralGamma(const double gamma) noexcept {
+    return std::abs(gamma - 1.0) < 0.0001;
 }
 
 NativeGammaRamp ToNativeRamp(const GammaRamp& ramp) {
@@ -275,16 +346,16 @@ bool ReadDeviceRamp(
     const std::wstring& deviceName,
     GammaRamp& ramp,
     std::wstring& errorMessage) {
-    HDC deviceContext = CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr);
-    if (deviceContext == nullptr) {
+    ScopedDc deviceContext(
+        CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr),
+        false);
+    if (deviceContext.value == nullptr) {
         errorMessage = L"Could not open " + deviceName + L": " +
                        FormatSystemError(GetLastError());
         return false;
     }
 
-    const bool succeeded = ReadDeviceRamp(deviceContext, ramp, errorMessage);
-    DeleteDC(deviceContext);
-    return succeeded;
+    return ReadDeviceRamp(deviceContext.value, ramp, errorMessage);
 }
 
 bool WriteDeviceRamp(
@@ -292,8 +363,10 @@ bool WriteDeviceRamp(
     const GammaRamp& requested,
     GammaRamp& actual,
     std::wstring& errorMessage) {
-    HDC deviceContext = CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr);
-    if (deviceContext == nullptr) {
+    ScopedDc deviceContext(
+        CreateDCW(L"DISPLAY", deviceName.c_str(), nullptr, nullptr),
+        false);
+    if (deviceContext.value == nullptr) {
         errorMessage = L"Could not open " + deviceName + L": " +
                        FormatSystemError(GetLastError());
         return false;
@@ -301,10 +374,9 @@ bool WriteDeviceRamp(
 
     NativeGammaRamp native = ToNativeRamp(requested);
     SetLastError(ERROR_SUCCESS);
-    const BOOL succeeded = SetDeviceGammaRamp(deviceContext, &native);
+    const BOOL succeeded = SetDeviceGammaRamp(deviceContext.value, &native);
     const DWORD setError = GetLastError();
     if (succeeded == FALSE) {
-        DeleteDC(deviceContext);
         errorMessage = L"The display driver rejected the gamma ramp";
         if (setError != ERROR_SUCCESS) {
             errorMessage += L": " + FormatSystemError(setError);
@@ -314,8 +386,8 @@ bool WriteDeviceRamp(
 
     // Verify through the context we already opened for this write.
     std::wstring readError;
-    const bool verified = ReadDeviceRamp(deviceContext, actual, readError);
-    DeleteDC(deviceContext);
+    const bool verified =
+        ReadDeviceRamp(deviceContext.value, actual, readError);
     if (!verified) {
         errorMessage = L"Windows accepted the gamma ramp, but it could not be verified. " +
                        readError;
@@ -1008,7 +1080,8 @@ void RecreateFonts() {
     HFONT newValue = CreateUiFont(g_mainWindow, 16, FW_SEMIBOLD);
     for (HWND control : {g_displayLabel, g_displayCombo, g_gammaLabel,
                          g_hotkeyLabel, g_hotkeyControl, g_clearHotkey,
-                         g_toggleLabel, g_toggleFirst, g_toggleSecond, g_autoRust}) {
+                         g_toggleLabel, g_toggleFirst, g_toggleSecond,
+                         g_autoRustCheckbox}) {
         AssignFont(control, newBody);
     }
     AssignFont(g_gammaValue, newValue);
@@ -1039,7 +1112,7 @@ void LayoutControls() {
     const int fieldWidth = (width - scale(116)) / 2;
     move(g_toggleFirst, margin + scale(104), 218, fieldWidth, 28);
     move(g_toggleSecond, margin + scale(116) + fieldWidth, 218, fieldWidth, 28);
-    move(g_autoRust, margin, 262, width, 28);
+    move(g_autoRustCheckbox, margin, 262, width, 28);
 }
 
 void PopulateDisplayCombo() {
@@ -1117,16 +1190,16 @@ std::wstring WindowExecutableName(const HWND window) {
         return {};
     }
 
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-    if (process == nullptr) {
+    ScopedHandle process(
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
+    if (!process) {
         return {};
     }
 
     std::array<wchar_t, 32768> path{};
     DWORD length = static_cast<DWORD>(path.size());
     const BOOL succeeded =
-        QueryFullProcessImageNameW(process, 0U, path.data(), &length);
-    CloseHandle(process);
+        QueryFullProcessImageNameW(process.value, 0U, path.data(), &length);
     if (succeeded == FALSE) {
         return {};
     }
@@ -1206,80 +1279,75 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     bitmapInfo.bmiHeader.biBitCount = 32U;
     bitmapInfo.bmiHeader.biCompression = BI_RGB;
 
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
+    ScopedDc screen(GetDC(nullptr), true);
+    if (screen.value == nullptr) {
         return false;
     }
-    HDC memory = CreateCompatibleDC(screen);
-    if (memory == nullptr) {
-        ReleaseDC(nullptr, screen);
+    ScopedDc memory(CreateCompatibleDC(screen.value), false);
+    if (memory.value == nullptr) {
         return false;
     }
 
     void* pixels = nullptr;
-    HBITMAP bitmap =
-        CreateDIBSection(screen, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0U);
-    if (bitmap == nullptr || pixels == nullptr) {
-        if (bitmap != nullptr) {
-            DeleteObject(bitmap);
-        }
-        DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
+    ScopedGdiObject bitmap(
+        reinterpret_cast<HGDIOBJ>(
+            CreateDIBSection(
+                screen.value,
+                &bitmapInfo,
+                DIB_RGB_COLORS,
+                &pixels,
+                nullptr,
+                0U)));
+    if (bitmap.value == nullptr || pixels == nullptr) {
         return false;
     }
 
-    const HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
-    SetStretchBltMode(memory, HALFTONE);
-    SetBrushOrgEx(memory, 0, 0, nullptr);
+    ScopedSelectedObject selected(memory.value, bitmap.value);
+    if (selected.previous == nullptr || selected.previous == HGDI_ERROR) {
+        return false;
+    }
+    SetStretchBltMode(memory.value, HALFTONE);
+    SetBrushOrgEx(memory.value, 0, 0, nullptr);
     const BOOL copied = StretchBlt(
-        memory,
+        memory.value,
         0,
         0,
         kSampleWidth,
         kSampleHeight,
-        screen,
+        screen.value,
         sourceX,
         sourceY,
         sourceWidth,
         sourceHeight,
         SRCCOPY);
     GdiFlush();
-
-    constexpr std::size_t kLuminanceBins = 1024U;
-    std::array<std::uint32_t, kLuminanceBins> histogram{};
-    std::size_t nonBlackPixels = 0U;
-    if (copied != FALSE) {
-        const auto& linear = LinearSrgbTable();
-        const auto* bytes = static_cast<const unsigned char*>(pixels);
-        constexpr std::size_t pixelCount =
-            static_cast<std::size_t>(kSampleWidth) * kSampleHeight;
-        for (std::size_t index = 0; index < pixelCount; ++index) {
-            const std::size_t offset = index * 4U;
-            if (bytes[offset] != 0U || bytes[offset + 1U] != 0U ||
-                bytes[offset + 2U] != 0U) {
-                ++nonBlackPixels;
-            }
-            const double pixelLuminance =
-                linear[bytes[offset + 2U]] * 0.2126 +
-                linear[bytes[offset + 1U]] * 0.7152 +
-                linear[bytes[offset]] * 0.0722;
-            const std::size_t bin = std::min(
-                static_cast<std::size_t>(pixelLuminance * kLuminanceBins),
-                kLuminanceBins - 1U);
-            ++histogram[bin];
-        }
-    }
-
-    SelectObject(memory, previousBitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
     if (copied == FALSE) {
         return false;
     }
 
+    constexpr std::size_t kLuminanceBins = 1024U;
+    std::array<std::uint32_t, kLuminanceBins> histogram{};
+    std::size_t nonBlackPixels = 0U;
+    const auto& linear = LinearSrgbTable();
+    const auto* bytes = static_cast<const unsigned char*>(pixels);
     constexpr std::size_t pixelCount =
         static_cast<std::size_t>(kSampleWidth) * kSampleHeight;
+    for (std::size_t index = 0; index < pixelCount; ++index) {
+        const std::size_t offset = index * 4U;
+        if (bytes[offset] != 0U || bytes[offset + 1U] != 0U ||
+            bytes[offset + 2U] != 0U) {
+            ++nonBlackPixels;
+        }
+        const double pixelLuminance =
+            linear[bytes[offset + 2U]] * 0.2126 +
+            linear[bytes[offset + 1U]] * 0.7152 +
+            linear[bytes[offset]] * 0.0722;
+        const std::size_t bin = std::min(
+            static_cast<std::size_t>(pixelLuminance * kLuminanceBins),
+            kLuminanceBins - 1U);
+        ++histogram[bin];
+    }
+
     // Screen capture protection and exclusive-fullscreen surfaces commonly
     // return an all-black image. Do not mistake that for an in-game night.
     if (nonBlackPixels < pixelCount / 100U) {
@@ -1300,21 +1368,33 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     return true;
 }
 
+int AutoControlledDisplayIndex() {
+    return g_savedAutoState
+               ? FindDisplayIndex(g_savedAutoState->deviceName)
+               : -1;
+}
+
+bool AutoControlsDisplay(const DisplayState& display) {
+    return g_savedAutoState &&
+           _wcsicmp(
+               g_savedAutoState->deviceName.c_str(),
+               display.deviceName.c_str()) == 0;
+}
+
 void DiscardSavedAutoState() {
-    const int index = FindDisplayIndex(g_savedAutoState.deviceName);
+    const int index = AutoControlledDisplayIndex();
     if (index >= 0) {
         g_displays[static_cast<std::size_t>(index)].autoControlled = false;
     }
-    g_hasSavedAutoState = false;
-    g_savedAutoState = {};
+    g_savedAutoState.reset();
     g_autoGammaDetector.Reset();
 }
 
 void RestoreAutoControlledDisplay() {
-    if (!g_hasSavedAutoState) {
+    if (!g_savedAutoState) {
         return;
     }
-    const SavedAutoControlState saved = g_savedAutoState;
+    const SavedAutoControlState saved = *g_savedAutoState;
     DiscardSavedAutoState();
 
     const int index = FindDisplayIndex(saved.deviceName);
@@ -1333,15 +1413,12 @@ void RestoreAutoControlledDisplay() {
 }
 
 void NeutralizeAutoControlledDisplay() {
-    if (!g_hasSavedAutoState) {
-        return;
-    }
-    const int index = FindDisplayIndex(g_savedAutoState.deviceName);
+    const int index = AutoControlledDisplayIndex();
     if (index < 0) {
         return;
     }
     DisplayState& display = g_displays[static_cast<std::size_t>(index)];
-    if (!display.enabled && std::abs(display.gamma - 1.0) < 0.0001) {
+    if (!display.enabled && IsNeutralGamma(display.gamma)) {
         return;
     }
     std::wstring error;
@@ -1351,6 +1428,17 @@ void NeutralizeAutoControlledDisplay() {
     if (index == g_selectedDisplay) {
         UpdateSelectedDisplayUi();
     }
+}
+
+void CaptureAutoControlState(DisplayState& display) {
+    NeutralizeAutoControlledDisplay();
+    DiscardSavedAutoState();
+    g_savedAutoState = SavedAutoControlState{
+        display.deviceName,
+        display.gamma,
+        display.enabled,
+    };
+    display.autoControlled = true;
 }
 
 void UpdateAutomaticGamma() {
@@ -1380,17 +1468,8 @@ void UpdateAutomaticGamma() {
         return;
     }
 
-    if (!g_hasSavedAutoState ||
-        _wcsicmp(
-            g_savedAutoState.deviceName.c_str(),
-            display.deviceName.c_str()) != 0) {
-        NeutralizeAutoControlledDisplay();
-        DiscardSavedAutoState();
-        g_savedAutoState.deviceName = display.deviceName;
-        g_savedAutoState.gamma = display.gamma;
-        g_savedAutoState.enabled = display.enabled;
-        g_hasSavedAutoState = true;
-        display.autoControlled = true;
+    if (!AutoControlsDisplay(display)) {
+        CaptureAutoControlState(display);
     }
 
     const double nightGamma =
@@ -1414,7 +1493,7 @@ void UpdateAutomaticGamma() {
         return;
     }
 
-    const bool enabled = std::abs(target - 1.0) >= 0.0001;
+    const bool enabled = !IsNeutralGamma(target);
     std::wstring error;
     if (!ApplyGammaToDisplay(display, target, enabled, error, false)) {
         g_autoRustEnabled = false;
@@ -1422,8 +1501,8 @@ void UpdateAutomaticGamma() {
         std::wstring saveError;
         SaveAutoRustSetting(false, saveError);
         DiscardSavedAutoState();
-        if (g_autoRust != nullptr) {
-            SendMessageW(g_autoRust, BM_SETCHECK, BST_UNCHECKED, 0);
+        if (g_autoRustCheckbox != nullptr) {
+            SendMessageW(g_autoRustCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
         }
         ReportError(L"Automatic Rust gamma was disabled: " + error);
         UpdateSelectedDisplayUi();
@@ -1435,9 +1514,9 @@ void UpdateAutomaticGamma() {
 }
 
 void SetAutoRustControlState() {
-    if (g_autoRust != nullptr) {
+    if (g_autoRustCheckbox != nullptr) {
         SendMessageW(
-            g_autoRust,
+            g_autoRustCheckbox,
             BM_SETCHECK,
             g_autoRustEnabled ? BST_CHECKED : BST_UNCHECKED,
             0);
@@ -1504,7 +1583,7 @@ void ApplySliderValue() {
     }
     DisplayState& display = g_displays[static_cast<std::size_t>(g_selectedDisplay)];
     const double gamma = SliderGamma();
-    const bool enabled = std::abs(gamma - 1.0) >= 0.0001;
+    const bool enabled = !IsNeutralGamma(gamma);
     std::wstring error;
     if (!ApplyGammaToDisplay(display, gamma, enabled, error)) {
         UpdateSelectedDisplayUi();
@@ -1541,7 +1620,7 @@ void ToggleGamma() {
     const double gamma = gamma_changer::NextToggleGamma(
         current, g_toggleFirstGamma, g_toggleSecondGamma);
     std::wstring error;
-    ApplyGammaToDisplay(display, gamma, std::abs(gamma - 1.0) >= 0.0001, error);
+    ApplyGammaToDisplay(display, gamma, !IsNeutralGamma(gamma), error);
     UpdateSelectedDisplayUi();
 }
 
@@ -1689,7 +1768,7 @@ void CreateMainControls() {
         ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, kControlToggleFirst, WS_EX_CLIENTEDGE);
     g_toggleSecond = CreateControl(L"EDIT", FormatGamma(g_toggleSecondGamma).c_str(),
         ES_CENTER | ES_AUTOHSCROLL | WS_TABSTOP, kControlToggleSecond, WS_EX_CLIENTEDGE);
-    g_autoRust = CreateControl(
+    g_autoRustCheckbox = CreateControl(
         L"BUTTON",
         L"Auto-brighten Rust when the game gets dark",
         BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -1864,7 +1943,7 @@ LRESULT CALLBACK MainWindowProc(
             if (identifier == kControlAutoRust && notification == BN_CLICKED) {
                 CancelPendingSliderApply();
                 const bool enabled =
-                    SendMessageW(g_autoRust, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    SendMessageW(g_autoRustCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 SetAutoRustEnabled(enabled, true);
                 return 0;
             }
@@ -2012,8 +2091,9 @@ int APIENTRY wWinMain(
     g_instance = instance;
     const bool startInBackground = HasBackgroundArgument();
 
-    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, kSingleInstanceName);
-    if (instanceMutex == nullptr) {
+    ScopedHandle instanceMutex(
+        CreateMutexW(nullptr, FALSE, kSingleInstanceName));
+    if (!instanceMutex) {
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2023,7 +2103,6 @@ int APIENTRY wWinMain(
                 PostMessageW(existing, kShowWindowMessage, 0, 0);
             }
         }
-        CloseHandle(instanceMutex);
         return 0;
     }
 
@@ -2040,7 +2119,6 @@ int APIENTRY wWinMain(
     if (icon.value == nullptr || smallIcon.value == nullptr ||
         !RegisterWindowClasses(icon.value, smallIcon.value)) {
         DeleteObject(g_backgroundBrush);
-        CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -2061,7 +2139,6 @@ int APIENTRY wWinMain(
         nullptr);
     if (window == nullptr) {
         DeleteObject(g_backgroundBrush);
-        CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -2090,6 +2167,5 @@ int APIENTRY wWinMain(
         DeleteObject(g_bodyFont);
     }
     DeleteObject(g_backgroundBrush);
-    CloseHandle(instanceMutex);
     return static_cast<int>(message.wParam);
 }

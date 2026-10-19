@@ -60,7 +60,6 @@ public:
     }
 
     bool IsNight() const noexcept { return night_; }
-    double FilteredLuminance() const noexcept { return filteredLuminance_; }
 
 private:
     bool initialized_ = false;
