@@ -16,10 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwctype>
-#include <locale>
-#include <iomanip>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,11 +45,13 @@ constexpr UINT kShowWindowMessage = WM_APP + 2U;
 constexpr UINT kSingleKeyMessage = WM_APP + 3U;
 constexpr UINT kKeyCapturedMessage = WM_APP + 4U;
 constexpr UINT kMapKeyStateMessage = WM_APP + 5U;
+constexpr UINT kForegroundChangedMessage = WM_APP + 6U;
 constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 constexpr UINT_PTR kAutoGammaTimerId = 3U;
 constexpr UINT_PTR kMapReleaseDelayTimerId = 4U;
 constexpr UINT kAutoGammaIntervalMilliseconds = 500U;
+constexpr UINT kAutoGammaIdleIntervalMilliseconds = 2000U;
 constexpr UINT kMapReleaseDelayMilliseconds = 100U;
 constexpr wchar_t kRustClientExecutable[] = L"RustClient.exe";
 constexpr UINT kRustMapVirtualKey = 'G';
@@ -191,6 +190,8 @@ struct DisplayState : PersistentDisplaySettings {
     bool rampReadable = false;
     bool automaticReapplyPaused = false;
     bool autoControlled = false;
+    // The baseline ramp rarely changes; only rewrite it to the registry when it does.
+    bool baselineDirty = false;
     std::wstring lastError;
 };
 
@@ -227,6 +228,8 @@ UINT g_taskbarCreatedMessage = 0U;
 gamma_changer::SingleKeyInput g_singleKeyInput;
 UINT g_pendingHotkeyVirtualKey = 0U;
 HHOOK g_keyboardHook = nullptr;
+HWINEVENTHOOK g_foregroundHook = nullptr;
+UINT g_autoTimerInterval = 0U;
 bool g_sliderApplyPending = false;
 bool g_autoRustEnabled = false;
 bool g_rustMapKeyHeld = false;
@@ -262,10 +265,16 @@ std::wstring FormatSystemError(const DWORD error) {
 }
 
 std::wstring FormatGamma(const double gamma) {
-    std::wostringstream stream;
-    stream.imbue(std::locale::classic());
-    stream << std::fixed << std::setprecision(2) << gamma;
-    return stream.str();
+    const long long hundredths = std::llround(gamma * 100.0);
+    const long long magnitude = hundredths < 0 ? -hundredths : hundredths;
+    std::wstring text = hundredths < 0 ? L"-" : L"";
+    text += std::to_wstring(magnitude / 100);
+    text += L'.';
+    if (magnitude % 100 < 10) {
+        text += L'0';
+    }
+    text += std::to_wstring(magnitude % 100);
+    return text;
 }
 
 bool IsNeutralGamma(const double gamma) noexcept {
@@ -389,10 +398,13 @@ std::uint64_t HashDeviceName(const std::wstring& deviceName) {
 }
 
 std::wstring DisplayRegistryPath(const std::wstring& deviceName) {
-    std::wostringstream stream;
-    stream << kAppRegistryPath << L"\\Displays\\" << std::hex << std::setw(16)
-           << std::setfill(L'0') << HashDeviceName(deviceName);
-    return stream.str();
+    std::wstring path = kAppRegistryPath;
+    path += L"\\Displays\\";
+    const std::uint64_t hash = HashDeviceName(deviceName);
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        path += L"0123456789abcdef"[(hash >> shift) & 0xFU];
+    }
+    return path;
 }
 
 ScopedRegistryKey OpenRegistryKey(
@@ -461,15 +473,15 @@ bool ReadRamp(HKEY key, const wchar_t* name, GammaRamp& ramp) {
     return true;
 }
 
-void WriteRamp(HKEY key, const wchar_t* name, const GammaRamp& ramp) {
+bool WriteRamp(HKEY key, const wchar_t* name, const GammaRamp& ramp) {
     const NativeGammaRamp native = ToNativeRamp(ramp);
-    RegSetValueExW(
+    return RegSetValueExW(
         key,
         name,
         0,
         REG_BINARY,
         reinterpret_cast<const BYTE*>(&native),
-        sizeof(native));
+        sizeof(native)) == ERROR_SUCCESS;
 }
 
 PersistentDisplaySettings LoadDisplaySettings(const std::wstring& deviceName) {
@@ -493,7 +505,7 @@ PersistentDisplaySettings LoadDisplaySettings(const std::wstring& deviceName) {
     return settings;
 }
 
-void SaveDisplaySettings(const DisplayState& display) {
+void SaveDisplaySettings(DisplayState& display) {
     auto key = OpenRegistryKey(
         DisplayRegistryPath(display.deviceName),
         KEY_SET_VALUE,
@@ -505,17 +517,20 @@ void SaveDisplaySettings(const DisplayState& display) {
     const DWORD gammaMilli = static_cast<DWORD>(std::lround(display.gamma * 1000.0));
     WriteDword(key.value, L"GammaMilli", gammaMilli);
     WriteDword(key.value, L"Enabled", display.enabled ? 1U : 0U);
-    const DWORD nameBytes = static_cast<DWORD>(
-        (display.deviceName.size() + 1U) * sizeof(wchar_t));
-    RegSetValueExW(
-        key.value,
-        L"DeviceName",
-        0,
-        REG_SZ,
-        reinterpret_cast<const BYTE*>(display.deviceName.c_str()),
-        nameBytes);
-    if (display.hasBaseline) {
-        WriteRamp(key.value, L"BaselineRamp", display.baseline);
+    if (display.baselineDirty || !display.hasBaseline) {
+        const DWORD nameBytes = static_cast<DWORD>(
+            (display.deviceName.size() + 1U) * sizeof(wchar_t));
+        RegSetValueExW(
+            key.value,
+            L"DeviceName",
+            0,
+            REG_SZ,
+            reinterpret_cast<const BYTE*>(display.deviceName.c_str()),
+            nameBytes);
+    }
+    if (display.hasBaseline && display.baselineDirty &&
+        WriteRamp(key.value, L"BaselineRamp", display.baseline)) {
+        display.baselineDirty = false;
     }
     if (display.hasLastApplied) {
         WriteRamp(key.value, L"LastAppliedRamp", display.lastApplied);
@@ -688,16 +703,16 @@ std::vector<DisplayState> EnumerateDisplays() {
             display.height = static_cast<int>(mode.dmPelsHeight);
         }
 
-        std::wostringstream label;
-        label << friendlyName;
+        std::wstring label = friendlyName;
         if (display.width > 0 && display.height > 0) {
-            label << L"  ·  " << display.width << L" × " << display.height;
+            label += L"  ·  " + std::to_wstring(display.width) + L" × " +
+                     std::to_wstring(display.height);
         }
         if (display.primary) {
-            label << L"  ·  Primary";
+            label += L"  ·  Primary";
         }
-        label << L"  (" << display.deviceName << L")";
-        display.label = label.str();
+        label += L"  (" + display.deviceName + L")";
+        display.label = std::move(label);
         displays.push_back(std::move(display));
     }
 
@@ -720,6 +735,20 @@ void ReportError(const std::wstring& message) {
     lstrcpynW(data.szInfoTitle, kWindowTitle, ARRAYSIZE(data.szInfoTitle));
     lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
     Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+// A persistent driver error is re-evaluated on every UI refresh, including each
+// automatic gamma switch; show the same balloon at most once every few seconds.
+void ReportDisplayError(const std::wstring& message) {
+    static std::wstring lastMessage;
+    static ULONGLONG lastTick = 0U;
+    const ULONGLONG now = GetTickCount64();
+    if (message == lastMessage && now - lastTick < 5000U) {
+        return;
+    }
+    lastMessage = message;
+    lastTick = now;
+    ReportError(message);
 }
 
 bool SingleKeyIsAllowed(const UINT virtualKey, std::wstring& errorMessage) {
@@ -953,6 +982,7 @@ void RefreshDisplays(const bool reapplySavedSettings) {
             display.baseline = previous->baseline;
             display.lastApplied = previous->lastApplied;
             display.hasBaseline = previous->hasBaseline;
+            display.baselineDirty = previous->baselineDirty;
             display.hasLastApplied = previous->hasLastApplied;
             display.lastError = previous->lastError;
             display.automaticReapplyPaused = previous->automaticReapplyPaused;
@@ -978,6 +1008,7 @@ void RefreshDisplays(const bool reapplySavedSettings) {
                 if (!currentIsOurs) {
                     display.baseline = current;
                     display.hasBaseline = true;
+                    display.baselineDirty = true;
                     SaveDisplaySettings(display);
                 }
             }
@@ -986,6 +1017,7 @@ void RefreshDisplays(const bool reapplySavedSettings) {
         if (!display.hasBaseline && display.rampReadable) {
             display.baseline = current;
             display.hasBaseline = true;
+            display.baselineDirty = true;
             SaveDisplaySettings(display);
         }
         if (!display.rampReadable) {
@@ -1117,7 +1149,7 @@ void UpdateSelectedDisplayUi() {
 
     if (!hasDisplay) {
         SetWindowTextW(g_gammaValue, L"—");
-        ReportError(L"No active desktop display was found.");
+        ReportDisplayError(L"No active desktop display was found.");
         g_updatingControls = false;
         return;
     }
@@ -1132,12 +1164,12 @@ void UpdateSelectedDisplayUi() {
     SetWindowTextW(g_gammaValue, display.automaticReapplyPaused ? L"—" : FormatGamma(gamma).c_str());
 
     if (!display.lastError.empty()) {
-        ReportError(display.lastError);
+        ReportDisplayError(display.lastError);
         if (!display.rampReadable || !display.hasBaseline) {
             EnableWindow(g_gammaSlider, FALSE);
         }
     } else if (!display.rampReadable || !display.hasBaseline) {
-        ReportError(
+        ReportDisplayError(
             L"This display driver does not provide a usable SDR hardware gamma ramp.");
         EnableWindow(g_gammaSlider, FALSE);
     }
@@ -1252,8 +1284,8 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     const int sourceWidth = clientWidth - 2 * cropX;
     const int sourceHeight = clientHeight - 2 * cropY;
 
-    constexpr int kSampleWidth = 160;
-    constexpr int kSampleHeight = 120;
+    constexpr int kSampleWidth = 80;
+    constexpr int kSampleHeight = 60;
 
     // The capture surface is reused across ticks; recreating a DC and DIB
     // section twice a second is pure overhead.
@@ -1452,12 +1484,60 @@ void CaptureAutoControlState(DisplayState& display) {
     display.autoControlled = true;
 }
 
+void CALLBACK ForegroundEventProc(
+    HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (g_mainWindow != nullptr) {
+        PostMessageW(g_mainWindow, kForegroundChangedMessage, 0, 0);
+    }
+}
+
+void SetAutoTimerInterval(const UINT interval) {
+    if (g_autoTimerInterval == interval) {
+        return;
+    }
+    if (SetTimer(g_mainWindow, kAutoGammaTimerId, interval, nullptr) != 0U) {
+        g_autoTimerInterval = interval;
+    }
+}
+
+// Polls quickly only while Rust is in front. The foreground hook reacts to
+// Alt-Tab immediately, so the idle poll is just a safety net.
+bool StartAutoGamma() {
+    SetAutoTimerInterval(kAutoGammaIntervalMilliseconds);
+    if (g_autoTimerInterval == 0U) {
+        return false;
+    }
+    if (g_foregroundHook == nullptr) {
+        g_foregroundHook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            nullptr,
+            ForegroundEventProc,
+            0U,
+            0U,
+            WINEVENT_OUTOFCONTEXT);
+    }
+    return true;
+}
+
+void StopAutoGamma() {
+    KillTimer(g_mainWindow, kAutoGammaTimerId);
+    g_autoTimerInterval = 0U;
+    if (g_foregroundHook != nullptr) {
+        UnhookWinEvent(g_foregroundHook);
+        g_foregroundHook = nullptr;
+    }
+}
+
 void UpdateAutomaticGamma() {
     if (!g_autoRustEnabled) {
         return;
     }
 
     const HWND rustWindow = RustForegroundWindow();
+    SetAutoTimerInterval(
+        rustWindow != nullptr ? kAutoGammaIntervalMilliseconds
+                              : kAutoGammaIdleIntervalMilliseconds);
     if (rustWindow == nullptr) {
         g_autoGammaDetector.Reset();
         g_rustMapKeyHeld = false;
@@ -1508,7 +1588,7 @@ void UpdateAutomaticGamma() {
     std::wstring error;
     if (!ApplyGammaToDisplay(display, target, enabled, error, false)) {
         g_autoRustEnabled = false;
-        KillTimer(g_mainWindow, kAutoGammaTimerId);
+        StopAutoGamma();
         std::wstring saveError;
         SaveAutoRustSetting(false, saveError);
         DiscardSavedAutoState();
@@ -1552,11 +1632,7 @@ void SetAutoRustEnabled(const bool enabled, const bool restoreManualGamma) {
     SetAutoRustControlState();
 
     if (enabled) {
-        if (SetTimer(
-                g_mainWindow,
-                kAutoGammaTimerId,
-                kAutoGammaIntervalMilliseconds,
-                nullptr) == 0U) {
+        if (!StartAutoGamma()) {
             g_autoRustEnabled = false;
             std::wstring timerError;
             SaveAutoRustSetting(false, timerError);
@@ -1564,7 +1640,7 @@ void SetAutoRustEnabled(const bool enabled, const bool restoreManualGamma) {
             ReportError(L"Windows could not start automatic Rust gamma.");
         }
     } else {
-        KillTimer(g_mainWindow, kAutoGammaTimerId);
+        StopAutoGamma();
         KillTimer(g_mainWindow, kMapReleaseDelayTimerId);
         if (restoreManualGamma) {
             RestoreAutoControlledDisplay();
@@ -1637,7 +1713,7 @@ void ToggleGamma() {
 
 void ResetAllDisplays() {
     CancelPendingSliderApply();
-    KillTimer(g_mainWindow, kAutoGammaTimerId);
+    StopAutoGamma();
     KillTimer(g_mainWindow, kMapReleaseDelayTimerId);
     DiscardSavedAutoState();
     for (auto& display : g_displays) {
@@ -1817,11 +1893,7 @@ LRESULT CALLBACK MainWindowProc(
                 ReportError(hotkeyError);
             }
             if (g_autoRustEnabled) {
-                SetTimer(
-                    window,
-                    kAutoGammaTimerId,
-                    kAutoGammaIntervalMilliseconds,
-                    nullptr);
+                StartAutoGamma();
             }
             return 0;
         }
@@ -2028,6 +2100,12 @@ LRESULT CALLBACK MainWindowProc(
             }
             return 0;
 
+        case kForegroundChangedMessage:
+            if (g_autoRustEnabled) {
+                UpdateAutomaticGamma();
+            }
+            return 0;
+
         case kTrayMessage:
             if (lParam == WM_LBUTTONDBLCLK || lParam == WM_LBUTTONUP) {
                 ShowMainWindow();
@@ -2051,7 +2129,7 @@ LRESULT CALLBACK MainWindowProc(
         case WM_DESTROY:
             CancelPendingSliderApply();
             KillTimer(window, kDisplayRefreshTimerId);
-            KillTimer(window, kAutoGammaTimerId);
+            StopAutoGamma();
             KillTimer(window, kMapReleaseDelayTimerId);
             WTSUnRegisterSessionNotification(window);
             RemoveSingleKeyHook();
