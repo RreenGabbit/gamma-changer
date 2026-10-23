@@ -1307,101 +1307,6 @@ bool MedianLuminance(
     return false;
 }
 
-// CPU fallback: GDI copy of a screen region, decimated to a small sample.
-bool SampleRegionGdi(
-    const int sourceX,
-    const int sourceY,
-    const int sourceWidth,
-    const int sourceHeight,
-    double& luminance) {
-    constexpr int kSampleWidth = 80;
-    constexpr int kSampleHeight = 60;
-
-    // The capture surface is reused across ticks; recreating a DC and DIB
-    // section twice a second is pure overhead.
-    struct SampleSurface {
-        HDC memory = nullptr;
-        HBITMAP bitmap = nullptr;
-        HGDIOBJ previous = nullptr;
-        void* pixels = nullptr;
-
-        SampleSurface() = default;
-        SampleSurface(const SampleSurface&) = delete;
-        SampleSurface& operator=(const SampleSurface&) = delete;
-
-        ~SampleSurface() {
-            if (memory != nullptr) {
-                if (previous != nullptr) {
-                    SelectObject(memory, previous);
-                }
-                DeleteDC(memory);
-            }
-            if (bitmap != nullptr) {
-                DeleteObject(bitmap);
-            }
-        }
-
-        bool Create(HDC screen) {
-            BITMAPINFO info{};
-            info.bmiHeader.biSize = sizeof(info.bmiHeader);
-            info.bmiHeader.biWidth = kSampleWidth;
-            info.bmiHeader.biHeight = -kSampleHeight;
-            info.bmiHeader.biPlanes = 1U;
-            info.bmiHeader.biBitCount = 32U;
-            info.bmiHeader.biCompression = BI_RGB;
-            memory = CreateCompatibleDC(screen);
-            bitmap = CreateDIBSection(
-                screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0U);
-            if (memory == nullptr || bitmap == nullptr || pixels == nullptr) {
-                return false;
-            }
-            previous = SelectObject(memory, bitmap);
-            if (previous == nullptr || previous == HGDI_ERROR) {
-                previous = nullptr;
-                return false;
-            }
-            SetStretchBltMode(memory, COLORONCOLOR);
-            return true;
-        }
-    };
-    static SampleSurface surface;
-    static bool surfaceReady = false;
-
-    ScopedDc screen(GetDC(nullptr), true);
-    if (screen.value == nullptr) {
-        return false;
-    }
-    if (!surfaceReady) {
-        if (!surface.Create(screen.value)) {
-            return false;
-        }
-        surfaceReady = true;
-    }
-
-    // Nearest-neighbour decimation is far cheaper than HALFTONE on a large
-    // window, and the median below does not need averaged samples.
-    const BOOL copied = StretchBlt(
-        surface.memory,
-        0,
-        0,
-        kSampleWidth,
-        kSampleHeight,
-        screen.value,
-        sourceX,
-        sourceY,
-        sourceWidth,
-        sourceHeight,
-        SRCCOPY);
-    GdiFlush();
-    if (copied == FALSE) {
-        return false;
-    }
-    return MedianLuminance(
-        static_cast<const unsigned char*>(surface.pixels),
-        static_cast<std::size_t>(kSampleWidth) * kSampleHeight,
-        luminance);
-}
-
 gamma_changer::DesktopDuplicationSampler g_gpuSampler;
 bool g_gpuLuminanceValid = false;
 double g_gpuLuminance = 0.0;
@@ -1434,34 +1339,43 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     const int sourceWidth = clientWidth - 2 * cropX;
     const int sourceHeight = clientHeight - 2 * cropY;
 
-    // GPU path: the frame is cropped and downscaled on the graphics card and
-    // only a tiny image comes back. A black or unavailable result falls
-    // through to the GDI path.
+    // The frame is cropped and downscaled on the GPU and only a tiny image
+    // comes back. There is no CPU capture path: if the GPU cannot capture, the
+    // sample fails and the user is told.
     const RECT region{sourceX, sourceY, sourceX + sourceWidth, sourceY + sourceHeight};
     gamma_changer::SampledImage image;
+    bool available = true;
     switch (g_gpuSampler.Capture(DisplayDeviceForWindow(window), region, image)) {
         case gamma_changer::DesktopDuplicationSampler::Result::Frame:
             g_gpuLuminanceValid = MedianLuminance(
                 image.bgra,
                 static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height),
                 g_gpuLuminance);
-            if (g_gpuLuminanceValid) {
-                luminance = g_gpuLuminance;
-                return true;
-            }
             break;
         case gamma_changer::DesktopDuplicationSampler::Result::Unchanged:
-            if (g_gpuLuminanceValid) {
-                luminance = g_gpuLuminance;
-                return true;
-            }
             break;
         case gamma_changer::DesktopDuplicationSampler::Result::Unavailable:
             g_gpuLuminanceValid = false;
+            available = false;
             break;
     }
 
-    return SampleRegionGdi(sourceX, sourceY, sourceWidth, sourceHeight, luminance);
+    static bool reportedUnavailable = false;
+    if (!available) {
+        if (!reportedUnavailable) {
+            reportedUnavailable = true;
+            ReportError(
+                L"GPU screen capture is unavailable (rotated or HDR display, exclusive "
+                L"fullscreen, or a driver limit). Automatic gamma cannot measure brightness.");
+        }
+        return false;
+    }
+    reportedUnavailable = false;
+    if (!g_gpuLuminanceValid) {
+        return false;  // black frame: protected or exclusive-fullscreen surface
+    }
+    luminance = g_gpuLuminance;
+    return true;
 }
 
 int AutoControlledDisplayIndex() {

@@ -51,13 +51,13 @@ struct SampledImage {
 // GPU-side brightness sampling through DXGI Desktop Duplication. The desktop
 // frame is cropped and box-filtered down by the GPU (GenerateMips); only a
 // tiny image is read back. Anything unsupported reports Unavailable so the
-// caller can fall back to GDI.
+// caller can report that capture is unsupported.
 class DesktopDuplicationSampler {
 public:
     enum class Result {
         Frame,        // image holds a fresh sample
         Unchanged,    // nothing was presented since the last Frame for this region
-        Unavailable,  // use the fallback capture path
+        Unavailable,  // GPU capture is not possible right now
     };
 
     ~DesktopDuplicationSampler() { Reset(); }
@@ -247,7 +247,7 @@ private:
                 }
                 DXGI_OUTDUPL_DESC duplicationDescription{};
                 duplication_->GetDesc(&duplicationDescription);
-                // HDR / wide-gamut desktops use a float format; leave those to GDI.
+                // HDR / wide-gamut desktops use a float format; capture is unsupported there.
                 if (duplicationDescription.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
                     return false;
                 }

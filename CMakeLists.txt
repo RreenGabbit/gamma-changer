@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     GammaChanger
-    VERSION 1.4.3
+    VERSION 1.4.4
     DESCRIPTION "Native Windows hardware gamma-ramp utility"
     LANGUAGES CXX)
 
