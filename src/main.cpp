@@ -141,36 +141,6 @@ struct ScopedDc {
     }
 };
 
-struct ScopedGdiObject {
-    HGDIOBJ value = nullptr;
-
-    explicit ScopedGdiObject(HGDIOBJ object) : value(object) {}
-    ScopedGdiObject(const ScopedGdiObject&) = delete;
-    ScopedGdiObject& operator=(const ScopedGdiObject&) = delete;
-
-    ~ScopedGdiObject() {
-        if (value != nullptr) {
-            DeleteObject(value);
-        }
-    }
-};
-
-struct ScopedSelectedObject {
-    HDC dc = nullptr;
-    HGDIOBJ previous = nullptr;
-
-    ScopedSelectedObject(HDC deviceContext, HGDIOBJ object)
-        : dc(deviceContext), previous(SelectObject(deviceContext, object)) {}
-    ScopedSelectedObject(const ScopedSelectedObject&) = delete;
-    ScopedSelectedObject& operator=(const ScopedSelectedObject&) = delete;
-
-    ~ScopedSelectedObject() {
-        if (previous != nullptr && previous != HGDI_ERROR) {
-            SelectObject(dc, previous);
-        }
-    }
-};
-
 struct ScopedRegistryKey {
     HKEY value = nullptr;
 
@@ -1183,30 +1153,29 @@ int FindDisplayIndex(const std::wstring& deviceName) {
     return -1;
 }
 
-std::wstring WindowExecutableName(const HWND window) {
-    DWORD processId = 0U;
-    GetWindowThreadProcessId(window, &processId);
-    if (processId == 0U) {
-        return {};
-    }
-
+std::wstring ProcessExecutableName(const DWORD processId) {
     ScopedHandle process(
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId));
     if (!process) {
         return {};
     }
 
-    std::array<wchar_t, 32768> path{};
-    DWORD length = static_cast<DWORD>(path.size());
-    const BOOL succeeded =
-        QueryFullProcessImageNameW(process.value, 0U, path.data(), &length);
-    if (succeeded == FALSE) {
-        return {};
+    // Most paths fit in MAX_PATH; grow only for long-path installs.
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD length = static_cast<DWORD>(path.size());
+        if (QueryFullProcessImageNameW(process.value, 0U, path.data(), &length) != FALSE) {
+            path.resize(length);
+            break;
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || path.size() >= 32768U) {
+            return {};
+        }
+        path.assign(path.size() * 2U, L'\0');
     }
 
-    std::wstring fullPath(path.data(), length);
-    const std::size_t slash = fullPath.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? fullPath : fullPath.substr(slash + 1U);
+    const std::size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1U);
 }
 
 HWND RustForegroundWindow() {
@@ -1215,10 +1184,24 @@ HWND RustForegroundWindow() {
         IsIconic(foreground) != FALSE) {
         return nullptr;
     }
-    const std::wstring executable = WindowExecutableName(foreground);
-    return _wcsicmp(executable.c_str(), kRustClientExecutable) == 0
-               ? foreground
-               : nullptr;
+
+    DWORD processId = 0U;
+    GetWindowThreadProcessId(foreground, &processId);
+    if (processId == 0U) {
+        return nullptr;
+    }
+
+    // This runs on every auto-gamma tick. Resolve the image name only when the
+    // foreground process changes instead of opening a process handle each time.
+    static DWORD cachedProcessId = 0U;
+    static bool cachedIsRust = false;
+    if (processId != cachedProcessId) {
+        cachedIsRust = _wcsicmp(
+                           ProcessExecutableName(processId).c_str(),
+                           kRustClientExecutable) == 0;
+        cachedProcessId = processId;
+    }
+    return cachedIsRust ? foreground : nullptr;
 }
 
 std::wstring DisplayDeviceForWindow(const HWND window) {
@@ -1271,45 +1254,72 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
 
     constexpr int kSampleWidth = 160;
     constexpr int kSampleHeight = 120;
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-    bitmapInfo.bmiHeader.biWidth = kSampleWidth;
-    bitmapInfo.bmiHeader.biHeight = -kSampleHeight;
-    bitmapInfo.bmiHeader.biPlanes = 1U;
-    bitmapInfo.bmiHeader.biBitCount = 32U;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    // The capture surface is reused across ticks; recreating a DC and DIB
+    // section twice a second is pure overhead.
+    struct SampleSurface {
+        HDC memory = nullptr;
+        HBITMAP bitmap = nullptr;
+        HGDIOBJ previous = nullptr;
+        void* pixels = nullptr;
+
+        SampleSurface() = default;
+        SampleSurface(const SampleSurface&) = delete;
+        SampleSurface& operator=(const SampleSurface&) = delete;
+
+        ~SampleSurface() {
+            if (memory != nullptr) {
+                if (previous != nullptr) {
+                    SelectObject(memory, previous);
+                }
+                DeleteDC(memory);
+            }
+            if (bitmap != nullptr) {
+                DeleteObject(bitmap);
+            }
+        }
+
+        bool Create(HDC screen) {
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(info.bmiHeader);
+            info.bmiHeader.biWidth = kSampleWidth;
+            info.bmiHeader.biHeight = -kSampleHeight;
+            info.bmiHeader.biPlanes = 1U;
+            info.bmiHeader.biBitCount = 32U;
+            info.bmiHeader.biCompression = BI_RGB;
+            memory = CreateCompatibleDC(screen);
+            bitmap = CreateDIBSection(
+                screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0U);
+            if (memory == nullptr || bitmap == nullptr || pixels == nullptr) {
+                return false;
+            }
+            previous = SelectObject(memory, bitmap);
+            if (previous == nullptr || previous == HGDI_ERROR) {
+                previous = nullptr;
+                return false;
+            }
+            SetStretchBltMode(memory, COLORONCOLOR);
+            return true;
+        }
+    };
+    static SampleSurface surface;
+    static bool surfaceReady = false;
 
     ScopedDc screen(GetDC(nullptr), true);
     if (screen.value == nullptr) {
         return false;
     }
-    ScopedDc memory(CreateCompatibleDC(screen.value), false);
-    if (memory.value == nullptr) {
-        return false;
+    if (!surfaceReady) {
+        if (!surface.Create(screen.value)) {
+            return false;
+        }
+        surfaceReady = true;
     }
 
-    void* pixels = nullptr;
-    ScopedGdiObject bitmap(
-        reinterpret_cast<HGDIOBJ>(
-            CreateDIBSection(
-                screen.value,
-                &bitmapInfo,
-                DIB_RGB_COLORS,
-                &pixels,
-                nullptr,
-                0U)));
-    if (bitmap.value == nullptr || pixels == nullptr) {
-        return false;
-    }
-
-    ScopedSelectedObject selected(memory.value, bitmap.value);
-    if (selected.previous == nullptr || selected.previous == HGDI_ERROR) {
-        return false;
-    }
-    SetStretchBltMode(memory.value, HALFTONE);
-    SetBrushOrgEx(memory.value, 0, 0, nullptr);
+    // Nearest-neighbour decimation is far cheaper than HALFTONE on a large
+    // window, and the median below does not need averaged samples.
     const BOOL copied = StretchBlt(
-        memory.value,
+        surface.memory,
         0,
         0,
         kSampleWidth,
@@ -1324,6 +1334,7 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     if (copied == FALSE) {
         return false;
     }
+    const void* pixels = surface.pixels;
 
     constexpr std::size_t kLuminanceBins = 1024U;
     std::array<std::uint32_t, kLuminanceBins> histogram{};
@@ -1817,7 +1828,7 @@ LRESULT CALLBACK MainWindowProc(
 
         case WM_SIZE:
             LayoutControls();
-            InvalidateRect(window, nullptr, TRUE);
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
 
         case WM_DPICHANGED: {
@@ -1841,6 +1852,10 @@ LRESULT CALLBACK MainWindowProc(
             minMax->ptMinTrackSize.y = ScaleForDpi(window, 350);
             return 0;
         }
+
+        case WM_ERASEBKGND:
+            // WM_PAINT fills the whole client area; erasing first only flickers.
+            return 1;
 
         case WM_PAINT: {
             PAINTSTRUCT paint{};
