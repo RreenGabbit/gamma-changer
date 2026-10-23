@@ -51,9 +51,11 @@ constexpr UINT_PTR kApplyTimerId = 1U;
 constexpr UINT_PTR kDisplayRefreshTimerId = 2U;
 constexpr UINT_PTR kAutoGammaTimerId = 3U;
 constexpr UINT_PTR kMapReleaseDelayTimerId = 4U;
+constexpr UINT_PTR kAutoCollectTimerId = 5U;
 constexpr UINT kAutoGammaIntervalMilliseconds = 500U;
 constexpr UINT kAutoGammaIdleIntervalMilliseconds = 2000U;
 constexpr UINT kMapReleaseDelayMilliseconds = 100U;
+constexpr UINT kAutoCollectIntervalMilliseconds = 12U;
 constexpr wchar_t kRustClientExecutable[] = L"RustClient.exe";
 constexpr UINT kRustMapVirtualKey = 'G';
 
@@ -1316,66 +1318,102 @@ void ResetGpuSampler() {
     g_gpuLuminanceValid = false;
 }
 
-bool SampleWindowLuminance(const HWND window, double& luminance) {
-    RECT client{};
-    if (GetClientRect(window, &client) == FALSE) {
-        return false;
-    }
-    POINT origin{0, 0};
-    if (ClientToScreen(window, &origin) == FALSE) {
-        return false;
-    }
+enum class SampleStatus {
+    Ready,    // luminance holds a fresh measurement
+    Pending,  // a sample is in flight on the GPU; collect it shortly
+    Failed,   // capture is unavailable or the frame was black
+};
 
-    const int clientWidth = client.right - client.left;
-    const int clientHeight = client.bottom - client.top;
-    if (clientWidth < 200 || clientHeight < 150) {
-        return false;
-    }
+// Never waits on the GPU. A tick submits a sample; the result is collected on
+// a following short timer (or the next tick) once the GPU has finished it.
+SampleStatus SampleWindowLuminance(
+    const HWND window,
+    const bool collectOnly,
+    double& luminance) {
+    using Sampler = gamma_changer::DesktopDuplicationSampler;
 
-    const int cropX = clientWidth / 8;
-    const int cropY = clientHeight / 8;
-    const int sourceX = origin.x + cropX;
-    const int sourceY = origin.y + cropY;
-    const int sourceWidth = clientWidth - 2 * cropX;
-    const int sourceHeight = clientHeight - 2 * cropY;
-
-    // The frame is cropped and downscaled on the GPU and only a tiny image
-    // comes back. There is no CPU capture path: if the GPU cannot capture, the
-    // sample fails and the user is told.
-    const RECT region{sourceX, sourceY, sourceX + sourceWidth, sourceY + sourceHeight};
+    bool fresh = false;
+    bool failed = false;
     gamma_changer::SampledImage image;
-    bool available = true;
-    switch (g_gpuSampler.Capture(DisplayDeviceForWindow(window), region, image)) {
-        case gamma_changer::DesktopDuplicationSampler::Result::Frame:
+    switch (g_gpuSampler.Collect(image)) {
+        case Sampler::CollectResult::Ready:
             g_gpuLuminanceValid = MedianLuminance(
                 image.bgra,
                 static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height),
                 g_gpuLuminance);
+            fresh = true;
             break;
-        case gamma_changer::DesktopDuplicationSampler::Result::Unchanged:
-            break;
-        case gamma_changer::DesktopDuplicationSampler::Result::Unavailable:
+        case Sampler::CollectResult::Failed:
             g_gpuLuminanceValid = false;
-            available = false;
+            failed = true;
+            break;
+        case Sampler::CollectResult::None:
             break;
     }
 
+    bool unchanged = false;
+    if (!collectOnly && !failed) {
+        RECT client{};
+        POINT origin{0, 0};
+        if (GetClientRect(window, &client) == FALSE ||
+            ClientToScreen(window, &origin) == FALSE) {
+            return SampleStatus::Failed;
+        }
+        const int clientWidth = client.right - client.left;
+        const int clientHeight = client.bottom - client.top;
+        if (clientWidth < 200 || clientHeight < 150) {
+            return SampleStatus::Failed;
+        }
+
+        const int cropX = clientWidth / 8;
+        const int cropY = clientHeight / 8;
+        const RECT region{
+            origin.x + cropX,
+            origin.y + cropY,
+            origin.x + clientWidth - cropX,
+            origin.y + clientHeight - cropY,
+        };
+        // The frame is cropped and downscaled on the GPU and only a tiny image
+        // comes back. There is no CPU capture path: if the GPU cannot capture,
+        // the sample fails and the user is told.
+        switch (g_gpuSampler.Submit(DisplayDeviceForWindow(window), region)) {
+            case Sampler::SubmitResult::Submitted:
+            case Sampler::SubmitResult::Busy:
+                break;
+            case Sampler::SubmitResult::Unchanged:
+                unchanged = true;
+                break;
+            case Sampler::SubmitResult::Unavailable:
+                g_gpuLuminanceValid = false;
+                failed = true;
+                break;
+        }
+    }
+
     static bool reportedUnavailable = false;
-    if (!available) {
+    if (failed) {
         if (!reportedUnavailable) {
             reportedUnavailable = true;
             ReportError(
                 L"GPU screen capture is unavailable (rotated or HDR display, exclusive "
                 L"fullscreen, or a driver limit). Automatic gamma cannot measure brightness.");
         }
-        return false;
+        return SampleStatus::Failed;
     }
     reportedUnavailable = false;
-    if (!g_gpuLuminanceValid) {
-        return false;  // black frame: protected or exclusive-fullscreen surface
+
+    if (fresh) {
+        if (!g_gpuLuminanceValid) {
+            return SampleStatus::Failed;  // black frame: protected or exclusive fullscreen
+        }
+        luminance = g_gpuLuminance;
+        return SampleStatus::Ready;
     }
-    luminance = g_gpuLuminance;
-    return true;
+    if (unchanged && g_gpuLuminanceValid) {
+        luminance = g_gpuLuminance;  // static scene: the last measurement still holds
+        return SampleStatus::Ready;
+    }
+    return SampleStatus::Pending;
 }
 
 int AutoControlledDisplayIndex() {
@@ -1489,6 +1527,7 @@ bool StartAutoGamma() {
 
 void StopAutoGamma() {
     ResetGpuSampler();
+    KillTimer(g_mainWindow, kAutoCollectTimerId);
     KillTimer(g_mainWindow, kAutoGammaTimerId);
     g_autoTimerInterval = 0U;
     if (g_foregroundHook != nullptr) {
@@ -1497,7 +1536,7 @@ void StopAutoGamma() {
     }
 }
 
-void UpdateAutomaticGamma() {
+void UpdateAutomaticGamma(const bool collectOnly = false) {
     if (!g_autoRustEnabled) {
         return;
     }
@@ -1540,9 +1579,21 @@ void UpdateAutomaticGamma() {
     double target = 1.0;
     if (!g_rustMapKeyHeld) {
         double luminance = 0.0;
-        if (!SampleWindowLuminance(rustWindow, luminance)) {
+        const SampleStatus status =
+            SampleWindowLuminance(rustWindow, collectOnly, luminance);
+        if (status == SampleStatus::Failed) {
             g_autoGammaDetector.Reset();
             NeutralizeAutoControlledDisplay();
+            return;
+        }
+        if (status == SampleStatus::Pending) {
+            if (g_gpuSampler.HasPending()) {
+                SetTimer(
+                    g_mainWindow,
+                    kAutoCollectTimerId,
+                    kAutoCollectIntervalMilliseconds,
+                    nullptr);
+            }
             return;
         }
         const bool night = g_autoGammaDetector.Update(luminance);
@@ -1961,6 +2012,11 @@ LRESULT CALLBACK MainWindowProc(
             }
             if (wParam == kAutoGammaTimerId) {
                 UpdateAutomaticGamma();
+                return 0;
+            }
+            if (wParam == kAutoCollectTimerId) {
+                KillTimer(window, kAutoCollectTimerId);
+                UpdateAutomaticGamma(true);
                 return 0;
             }
             if (wParam == kMapReleaseDelayTimerId) {

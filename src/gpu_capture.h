@@ -52,18 +52,32 @@ struct SampledImage {
 // frame is cropped and box-filtered down by the GPU (GenerateMips); only a
 // tiny image is read back. Anything unsupported reports Unavailable so the
 // caller can report that capture is unsupported.
+//
+// Readback is asynchronous: Submit queues the GPU work and returns at once,
+// and Collect later picks up the finished sample without ever waiting on the
+// GPU, so the game's own rendering is never stalled by us.
 class DesktopDuplicationSampler {
 public:
-    enum class Result {
-        Frame,        // image holds a fresh sample
-        Unchanged,    // nothing was presented since the last Frame for this region
+    enum class SubmitResult {
+        Submitted,    // a sample is in flight; poll Collect
+        Unchanged,    // nothing was presented since the last sample of this region
+        Busy,         // both staging buffers are still in flight; try again later
         Unavailable,  // GPU capture is not possible right now
+    };
+
+    enum class CollectResult {
+        Ready,   // image holds the newest finished sample
+        None,    // nothing finished yet (or nothing in flight)
+        Failed,  // the readback failed; capture was reset
     };
 
     ~DesktopDuplicationSampler() { Reset(); }
 
     void Reset() noexcept {
-        staging_.Reset();
+        for (auto& slot : slots_) {
+            slot.texture.Reset();
+            slot.pending = false;
+        }
         cropView_.Reset();
         crop_.Reset();
         duplication_.Reset();
@@ -75,20 +89,17 @@ public:
         haveFrame_ = false;
     }
 
-    Result Capture(
-        const std::wstring& deviceName,
-        const RECT& screenRect,
-        SampledImage& image) {
+    SubmitResult Submit(const std::wstring& deviceName, const RECT& screenRect) {
         const ULONGLONG now = GetTickCount64();
         if (!duplication_ || _wcsicmp(outputName_.c_str(), deviceName.c_str()) != 0) {
             Reset();
             if (deviceName.empty() || now < retryAfter_) {
-                return Result::Unavailable;
+                return SubmitResult::Unavailable;
             }
             if (!Initialize(deviceName)) {
                 Reset();
                 retryAfter_ = now + 5000U;
-                return Result::Unavailable;
+                return SubmitResult::Unavailable;
             }
         }
 
@@ -105,12 +116,23 @@ public:
         const int width = static_cast<int>(region.right - region.left);
         const int height = static_cast<int>(region.bottom - region.top);
         if (width < 160 || height < 120) {
-            return Result::Unavailable;
+            return SubmitResult::Unavailable;
         }
         if (!EnsureResources(width, height)) {
             Reset();
             retryAfter_ = now + 5000U;
-            return Result::Unavailable;
+            return SubmitResult::Unavailable;
+        }
+
+        Slot* target = nullptr;
+        for (auto& slot : slots_) {
+            if (!slot.pending) {
+                target = &slot;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            return SubmitResult::Busy;
         }
 
         DXGI_OUTDUPL_FRAME_INFO info{};
@@ -119,13 +141,13 @@ public:
             haveFrame_ ? 0U : 100U, &info, resource.Put());
         if (acquired == DXGI_ERROR_WAIT_TIMEOUT) {
             const bool same = haveFrame_ && EqualRect(&region, &lastRegion_) != FALSE;
-            return same ? Result::Unchanged : Result::Unavailable;
+            return same ? SubmitResult::Unchanged : SubmitResult::Unavailable;
         }
         if (FAILED(acquired)) {
             // Typically DXGI_ERROR_ACCESS_LOST after a mode change or desktop switch.
             Reset();
             retryAfter_ = now + 1000U;
-            return Result::Unavailable;
+            return SubmitResult::Unavailable;
         }
 
         bool copied = false;
@@ -148,35 +170,88 @@ public:
         if (!copied) {
             Reset();
             retryAfter_ = now + 5000U;
-            return Result::Unavailable;
+            return SubmitResult::Unavailable;
         }
 
         context_->GenerateMips(cropView_.Get());
         context_->CopySubresourceRegion(
-            staging_.Get(), 0U, 0U, 0U, 0U, crop_.Get(), static_cast<UINT>(mip_), nullptr);
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(context_->Map(staging_.Get(), 0U, D3D11_MAP_READ, 0U, &mapped))) {
-            Reset();
-            retryAfter_ = now + 5000U;
-            return Result::Unavailable;
-        }
-        const std::size_t rowBytes = static_cast<std::size_t>(stagingWidth_) * 4U;
-        pixels_.resize(rowBytes * static_cast<std::size_t>(stagingHeight_));
-        for (int row = 0; row < stagingHeight_; ++row) {
-            std::memcpy(
-                pixels_.data() + rowBytes * static_cast<std::size_t>(row),
-                static_cast<const unsigned char*>(mapped.pData) +
-                    static_cast<std::size_t>(mapped.RowPitch) * static_cast<std::size_t>(row),
-                rowBytes);
-        }
-        context_->Unmap(staging_.Get(), 0U);
+            target->texture.Get(), 0U, 0U, 0U, 0U, crop_.Get(), static_cast<UINT>(mip_), nullptr);
+        context_->Flush();  // hand the work to the GPU now; do not wait for it
 
+        target->pending = true;
+        target->submittedAt = now;
+        target->sequence = ++sequence_;
         lastRegion_ = region;
         haveFrame_ = true;
+        return SubmitResult::Submitted;
+    }
+
+    bool HasPending() const noexcept {
+        for (const auto& slot : slots_) {
+            if (slot.pending) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Never blocks: a sample the GPU has not finished is simply left for later.
+    CollectResult Collect(SampledImage& image) {
+        if (!context_) {
+            return CollectResult::None;
+        }
+        const ULONGLONG now = GetTickCount64();
+        bool ready = false;
+        for (;;) {
+            Slot* oldest = nullptr;
+            for (auto& slot : slots_) {
+                if (slot.pending && (oldest == nullptr || slot.sequence < oldest->sequence)) {
+                    oldest = &slot;
+                }
+            }
+            if (oldest == nullptr) {
+                break;
+            }
+
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            const HRESULT mappedResult = context_->Map(
+                oldest->texture.Get(), 0U, D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (mappedResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                // Give up on a sample that never completes rather than waiting forever.
+                if (now - oldest->submittedAt > 250U) {
+                    oldest->pending = false;
+                    continue;
+                }
+                break;
+            }
+            if (FAILED(mappedResult)) {
+                Reset();
+                retryAfter_ = now + 1000U;
+                return CollectResult::Failed;
+            }
+
+            const std::size_t rowBytes = static_cast<std::size_t>(stagingWidth_) * 4U;
+            pixels_.resize(rowBytes * static_cast<std::size_t>(stagingHeight_));
+            for (int row = 0; row < stagingHeight_; ++row) {
+                std::memcpy(
+                    pixels_.data() + rowBytes * static_cast<std::size_t>(row),
+                    static_cast<const unsigned char*>(mapped.pData) +
+                        static_cast<std::size_t>(mapped.RowPitch) * static_cast<std::size_t>(row),
+                    rowBytes);
+            }
+            context_->Unmap(oldest->texture.Get(), 0U);
+            oldest->pending = false;
+            ready = true;  // keep draining so the newest finished sample wins
+        }
+
+        if (!ready) {
+            return CollectResult::None;
+        }
         image.width = stagingWidth_;
         image.height = stagingHeight_;
         image.bgra = pixels_.data();
-        return Result::Frame;
+        return CollectResult::Ready;
     }
 
 private:
@@ -265,7 +340,10 @@ private:
         if (crop_ && width == cropWidth_ && height == cropHeight_) {
             return true;
         }
-        staging_.Reset();
+        for (auto& slot : slots_) {
+            slot.texture.Reset();
+            slot.pending = false;
+        }
         cropView_.Reset();
         crop_.Reset();
         haveFrame_ = false;
@@ -302,8 +380,10 @@ private:
         stagingDescription.SampleDesc.Count = 1U;
         stagingDescription.Usage = D3D11_USAGE_STAGING;
         stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(device_->CreateTexture2D(&stagingDescription, nullptr, staging_.Put()))) {
-            return false;
+        for (auto& slot : slots_) {
+            if (FAILED(device_->CreateTexture2D(&stagingDescription, nullptr, slot.texture.Put()))) {
+                return false;
+            }
         }
         cropWidth_ = width;
         cropHeight_ = height;
@@ -315,7 +395,15 @@ private:
     ComPtr<IDXGIOutputDuplication> duplication_;
     ComPtr<ID3D11Texture2D> crop_;
     ComPtr<ID3D11ShaderResourceView> cropView_;
-    ComPtr<ID3D11Texture2D> staging_;
+    // Two staging buffers let one sample finish while the next is queued.
+    struct Slot {
+        ComPtr<ID3D11Texture2D> texture;
+        bool pending = false;
+        ULONGLONG submittedAt = 0U;
+        std::uint64_t sequence = 0U;
+    };
+    Slot slots_[2];
+    std::uint64_t sequence_ = 0U;
     std::wstring outputName_;
     RECT desktop_{};
     RECT lastRegion_{};
