@@ -24,6 +24,7 @@
 #include "auto_gamma.h"
 #include "gamma_math.h"
 #include "gamma_toggle.h"
+#include "gpu_capture.h"
 #include "resource.h"
 #include "single_key.h"
 #include "single_key_win32.h"
@@ -1261,29 +1262,58 @@ const std::array<double, 256>& LinearSrgbTable() {
     return table;
 }
 
-bool SampleWindowLuminance(const HWND window, double& luminance) {
-    RECT client{};
-    if (GetClientRect(window, &client) == FALSE) {
-        return false;
-    }
-    POINT origin{0, 0};
-    if (ClientToScreen(window, &origin) == FALSE) {
-        return false;
+// Median scene brightness of a BGRA image. Returns false for an all-black
+// image, which is what protected or exclusive-fullscreen surfaces produce.
+bool MedianLuminance(
+    const unsigned char* bytes,
+    const std::size_t pixelCount,
+    double& luminance) {
+    constexpr std::size_t kLuminanceBins = 1024U;
+    std::array<std::uint32_t, kLuminanceBins> histogram{};
+    std::size_t nonBlackPixels = 0U;
+    const auto& linear = LinearSrgbTable();
+    for (std::size_t index = 0; index < pixelCount; ++index) {
+        const std::size_t offset = index * 4U;
+        if (bytes[offset] != 0U || bytes[offset + 1U] != 0U ||
+            bytes[offset + 2U] != 0U) {
+            ++nonBlackPixels;
+        }
+        const double pixelLuminance =
+            linear[bytes[offset + 2U]] * 0.2126 +
+            linear[bytes[offset + 1U]] * 0.7152 +
+            linear[bytes[offset]] * 0.0722;
+        const std::size_t bin = std::min(
+            static_cast<std::size_t>(pixelLuminance * kLuminanceBins),
+            kLuminanceBins - 1U);
+        ++histogram[bin];
     }
 
-    const int clientWidth = client.right - client.left;
-    const int clientHeight = client.bottom - client.top;
-    if (clientWidth < 200 || clientHeight < 150) {
+    // Do not mistake a black capture for an in-game night.
+    if (nonBlackPixels < pixelCount / 100U) {
         return false;
     }
+    // The median is resistant to HUD elements, muzzle flashes, and small lamps.
+    const std::size_t medianTarget = pixelCount / 2U;
+    std::size_t accumulated = 0U;
+    for (std::size_t bin = 0; bin < histogram.size(); ++bin) {
+        accumulated += histogram[bin];
+        if (accumulated > medianTarget) {
+            luminance =
+                (static_cast<double>(bin) + 0.5) /
+                static_cast<double>(kLuminanceBins);
+            return true;
+        }
+    }
+    return false;
+}
 
-    const int cropX = clientWidth / 8;
-    const int cropY = clientHeight / 8;
-    const int sourceX = origin.x + cropX;
-    const int sourceY = origin.y + cropY;
-    const int sourceWidth = clientWidth - 2 * cropX;
-    const int sourceHeight = clientHeight - 2 * cropY;
-
+// CPU fallback: GDI copy of a screen region, decimated to a small sample.
+bool SampleRegionGdi(
+    const int sourceX,
+    const int sourceY,
+    const int sourceWidth,
+    const int sourceHeight,
+    double& luminance) {
     constexpr int kSampleWidth = 80;
     constexpr int kSampleHeight = 60;
 
@@ -1366,49 +1396,72 @@ bool SampleWindowLuminance(const HWND window, double& luminance) {
     if (copied == FALSE) {
         return false;
     }
-    const void* pixels = surface.pixels;
+    return MedianLuminance(
+        static_cast<const unsigned char*>(surface.pixels),
+        static_cast<std::size_t>(kSampleWidth) * kSampleHeight,
+        luminance);
+}
 
-    constexpr std::size_t kLuminanceBins = 1024U;
-    std::array<std::uint32_t, kLuminanceBins> histogram{};
-    std::size_t nonBlackPixels = 0U;
-    const auto& linear = LinearSrgbTable();
-    const auto* bytes = static_cast<const unsigned char*>(pixels);
-    constexpr std::size_t pixelCount =
-        static_cast<std::size_t>(kSampleWidth) * kSampleHeight;
-    for (std::size_t index = 0; index < pixelCount; ++index) {
-        const std::size_t offset = index * 4U;
-        if (bytes[offset] != 0U || bytes[offset + 1U] != 0U ||
-            bytes[offset + 2U] != 0U) {
-            ++nonBlackPixels;
-        }
-        const double pixelLuminance =
-            linear[bytes[offset + 2U]] * 0.2126 +
-            linear[bytes[offset + 1U]] * 0.7152 +
-            linear[bytes[offset]] * 0.0722;
-        const std::size_t bin = std::min(
-            static_cast<std::size_t>(pixelLuminance * kLuminanceBins),
-            kLuminanceBins - 1U);
-        ++histogram[bin];
-    }
+gamma_changer::DesktopDuplicationSampler g_gpuSampler;
+bool g_gpuLuminanceValid = false;
+double g_gpuLuminance = 0.0;
 
-    // Screen capture protection and exclusive-fullscreen surfaces commonly
-    // return an all-black image. Do not mistake that for an in-game night.
-    if (nonBlackPixels < pixelCount / 100U) {
+void ResetGpuSampler() {
+    g_gpuSampler.Reset();
+    g_gpuLuminanceValid = false;
+}
+
+bool SampleWindowLuminance(const HWND window, double& luminance) {
+    RECT client{};
+    if (GetClientRect(window, &client) == FALSE) {
         return false;
     }
-    // The median is resistant to HUD elements, muzzle flashes, and small lamps.
-    const std::size_t medianTarget = pixelCount / 2U;
-    std::size_t accumulated = 0U;
-    for (std::size_t bin = 0; bin < histogram.size(); ++bin) {
-        accumulated += histogram[bin];
-        if (accumulated > medianTarget) {
-            luminance =
-                (static_cast<double>(bin) + 0.5) /
-                static_cast<double>(kLuminanceBins);
-            break;
-        }
+    POINT origin{0, 0};
+    if (ClientToScreen(window, &origin) == FALSE) {
+        return false;
     }
-    return true;
+
+    const int clientWidth = client.right - client.left;
+    const int clientHeight = client.bottom - client.top;
+    if (clientWidth < 200 || clientHeight < 150) {
+        return false;
+    }
+
+    const int cropX = clientWidth / 8;
+    const int cropY = clientHeight / 8;
+    const int sourceX = origin.x + cropX;
+    const int sourceY = origin.y + cropY;
+    const int sourceWidth = clientWidth - 2 * cropX;
+    const int sourceHeight = clientHeight - 2 * cropY;
+
+    // GPU path: the frame is cropped and downscaled on the graphics card and
+    // only a tiny image comes back. A black or unavailable result falls
+    // through to the GDI path.
+    const RECT region{sourceX, sourceY, sourceX + sourceWidth, sourceY + sourceHeight};
+    gamma_changer::SampledImage image;
+    switch (g_gpuSampler.Capture(DisplayDeviceForWindow(window), region, image)) {
+        case gamma_changer::DesktopDuplicationSampler::Result::Frame:
+            g_gpuLuminanceValid = MedianLuminance(
+                image.bgra,
+                static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height),
+                g_gpuLuminance);
+            if (g_gpuLuminanceValid) {
+                luminance = g_gpuLuminance;
+                return true;
+            }
+            break;
+        case gamma_changer::DesktopDuplicationSampler::Result::Unchanged:
+            if (g_gpuLuminanceValid) {
+                luminance = g_gpuLuminance;
+                return true;
+            }
+            break;
+        case gamma_changer::DesktopDuplicationSampler::Result::Unavailable:
+            g_gpuLuminanceValid = false;
+            break;
+    }
+
+    return SampleRegionGdi(sourceX, sourceY, sourceWidth, sourceHeight, luminance);
 }
 
 int AutoControlledDisplayIndex() {
@@ -1521,6 +1574,7 @@ bool StartAutoGamma() {
 }
 
 void StopAutoGamma() {
+    ResetGpuSampler();
     KillTimer(g_mainWindow, kAutoGammaTimerId);
     g_autoTimerInterval = 0U;
     if (g_foregroundHook != nullptr) {
@@ -1539,6 +1593,7 @@ void UpdateAutomaticGamma() {
         rustWindow != nullptr ? kAutoGammaIntervalMilliseconds
                               : kAutoGammaIdleIntervalMilliseconds);
     if (rustWindow == nullptr) {
+        ResetGpuSampler();
         g_autoGammaDetector.Reset();
         g_rustMapKeyHeld = false;
         NeutralizeAutoControlledDisplay();
@@ -1984,6 +2039,7 @@ LRESULT CALLBACK MainWindowProc(
             if (wParam == kDisplayRefreshTimerId) {
                 KillTimer(window, kDisplayRefreshTimerId);
                 FlushPendingSliderApply();
+                ResetGpuSampler();
                 RefreshDisplays(true);
                 PopulateDisplayCombo();
                 UpdateSelectedDisplayUi();

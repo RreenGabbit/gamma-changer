@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     GammaChanger
-    VERSION 1.4.2
+    VERSION 1.4.3
     DESCRIPTION "Native Windows hardware gamma-ramp utility"
     LANGUAGES CXX)
 
@@ -30,6 +30,7 @@ if(WIN32)
         src/main.cpp
         src/auto_gamma.h
         src/gamma_toggle.h
+        src/gpu_capture.h
         src/resource.h
         src/single_key.h
         src/single_key_win32.h
