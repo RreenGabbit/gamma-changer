@@ -14,18 +14,25 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
-      - name: Configure
-        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+      - name: Test
+        run: cargo test --locked
 
       - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: cargo build --release --locked
 
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:
           name: GammaChanger-windows-x64
-          path: build/Release/GammaChanger.exe
+          path: target/release/GammaChanger.exe
           if-no-files-found: error
+
+  portable-core:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Test platform-independent core
+        run: cargo test --locked

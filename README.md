@@ -21,23 +21,16 @@ calibration instead of replacing it with a generic identity ramp.
 
 ## Build
 
-The fastest option is Visual Studio 2022 Build Tools with the **Desktop development
-with C++** workload:
-
-1. Open **x64 Native Tools Command Prompt for VS 2022**.
-2. Change to this project directory.
-3. Run `build.bat`.
-4. Start `build\GammaChanger.exe`.
-
-Or use CMake:
+Gamma Changer is written in Rust. Install the [Rust toolchain](https://rustup.rs) and build on Windows:
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+cargo build --release
 ```
 
-No installer or third-party runtime is required. Settings are stored for the current
+The executable is `target\release\GammaChanger.exe`. It can also be cross-compiled from Linux
+with the `x86_64-pc-windows-gnu` target and MinGW (`cargo build --release --target x86_64-pc-windows-gnu`).
+
+No installer or runtime is required. Settings are stored for the current
 user under `HKCU\Software\GammaChanger`.
 
 Prebuilt x64 executables are published on the repository's **Releases** page. The
@@ -84,21 +77,12 @@ requested here.
 
 ## Tests
 
-Run the ramp-math, automatic-gamma, configurable-toggle, and single-key regression tests with CMake on Windows or Linux:
+The ramp math, automatic-gamma detector, toggle parsing and single-key state live in a
+platform-independent library, so the regression tests run on Windows, Linux and macOS:
 
 ```bash
-cmake -S . -B build-local/tests -DBUILD_TESTING=ON
-cmake --build build-local/tests --config Release
-ctest --test-dir build-local/tests -C Release --output-on-failure
+cargo test
 ```
 
-The Windows run also checks left/right modifier resolution using the Windows API.
-To compile just the platform-independent ramp math directly:
-
-On any C++17 system:
-
-```bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic -Isrc \
-  src/gamma_math.cpp tests/gamma_math_tests.cpp -o gamma_math_tests
-./gamma_math_tests
-```
+The Win32 front end (`src/win/`) only builds for Windows; check it from any host with
+`cargo check --target x86_64-pc-windows-gnu`.

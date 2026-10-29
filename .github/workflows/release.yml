@@ -16,19 +16,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
-      - name: Configure
-        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+      - name: Test
+        run: cargo test --locked
 
       - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: cargo build --release --locked
 
       - name: Checksum
         shell: pwsh
         run: |
-          Copy-Item build/Release/GammaChanger.exe GammaChanger.exe
+          Copy-Item target/release/GammaChanger.exe GammaChanger.exe
           $hash = (Get-FileHash GammaChanger.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  GammaChanger.exe" | Out-File -Encoding ascii -NoNewline SHA256SUMS.txt
 
